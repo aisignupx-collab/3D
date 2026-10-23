@@ -1,0 +1,17 @@
+# Core orchestrator (install PyTorch first - see README / scripts/setup_*.{sh,ps1})
+numpy>=1.24
+pillow>=10.0
+requests>=2.31
+pyyaml>=6.0
+trimesh>=4.0
+rembg[gpu]>=2.0.50        # use plain "rembg" on machines without CUDA
+
+# Optional: in-process text-to-image instead of ComfyUI (diffusion.backend: diffusers)
+# diffusers>=0.30
+# transformers>=4.44
+# accelerate>=0.33
+# safetensors>=0.4
+# sentencepiece>=0.2      # FLUX / SD3 text encoders
+
+# Tests
+pytest>=8.0

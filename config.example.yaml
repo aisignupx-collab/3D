@@ -1,0 +1,106 @@
+# Copy to config.yaml and pass with --config config.yaml.
+# Every key is optional; omitted keys use the defaults in config.py.
+# Env vars override this file: BLENDER_PATH, LLM_BASE_URL, LLM_MODEL,
+# VISION_BASE_URL, VISION_MODEL, COMFYUI_URL, TRIPOSR_REPO, INSTANTMESH_REPO.
+
+output_root: outputs
+
+# --- Stage 1: concept planning LLM -------------------------------------------
+llm:
+  provider: openai_compatible        # openai_compatible | anthropic | none
+  base_url: http://localhost:11434/v1  # Ollama. vLLM: :8000/v1, LM Studio: :1234/v1
+  model: qwen2.5:14b-instruct
+  api_key_env: LLM_API_KEY           # only needed for hosted endpoints
+  temperature: 0.2
+  json_mode: true                    # sends response_format=json_object (auto-retries without)
+
+# Cloud alternative (Claude):
+# llm:
+#   provider: anthropic
+#   model: claude-opus-5-5
+#   api_key_env: ANTHROPIC_API_KEY
+
+# --- Stage 6: vision auditor (also captions --image_input) -------------------
+vision:
+  provider: openai_compatible
+  base_url: http://localhost:11434/v1
+  model: qwen2.5vl:7b                # or llava:13b, minicpm-v, llama3.2-vision
+  contact_sheet: true                # one tiled image; best for small local VLMs
+  max_image_side: 1024
+
+# --- Stage 1: text-to-image reference sheets ---------------------------------
+diffusion:
+  backend: comfyui                   # comfyui | diffusers | none
+  comfyui_url: http://127.0.0.1:8188
+  comfyui_checkpoint: sd_xl_base_1.0.safetensors
+  # For FLUX or a custom graph, export it with "Save (API Format)" and use
+  # placeholders {{PROMPT}} {{NEGATIVE}} {{SEED}} {{WIDTH}} {{HEIGHT}}:
+  # comfyui_workflow: workflows/flux_dev_api.json
+  diffusers_model: stabilityai/stable-diffusion-xl-base-1.0
+  diffusers_dtype: float16           # bfloat16 for FLUX
+  diffusers_cpu_offload: false       # true on 8-12 GB cards
+  width: 1024
+  height: 1024
+  steps: 30
+  guidance: 6.0
+  seed: 1234
+  views: [front, side, isometric]
+  primary_view: isometric            # the view fed to single-image reconstruction
+  rembg_model: isnet-general-use
+
+# --- Stage 2: image-to-3D ------------------------------------------------------
+reconstruction:
+  backend: triposr                   # triposr | instantmesh | proxy (no ML, for testing)
+  device: cuda:0
+  triposr_repo: third_party/TripoSR
+  triposr_model: stabilityai/TripoSR
+  triposr_mc_resolution: 320         # marching cubes grid; 256 = faster, 384+ = more detail
+  triposr_chunk_size: 8192           # lower if VRAM is tight
+  input_size: 512
+  foreground_ratio: 0.85
+  instantmesh_repo: third_party/InstantMesh
+  instantmesh_python: null           # e.g. ~/miniconda3/envs/instantmesh/bin/python
+  instantmesh_config: configs/instant-mesh-large.yaml
+
+# --- Stages 3-6: Blender -------------------------------------------------------
+blender:
+  executable: null                   # e.g. /opt/blender-4.2/blender or C:/Program Files/Blender Foundation/Blender 4.2/blender.exe
+  use_gpu: true
+  compute_device: AUTO               # AUTO | OPTIX | CUDA | HIP | ONEAPI | METAL | CPU
+  # Stage 3 - topology
+  min_island_ratio: 0.002            # drop floaters smaller than this fraction of faces
+  fill_holes: true
+  auto_orient: true                  # fix "lying on its side" via bbox ratios vs the spec
+  import_rotation_deg: [0, 0, 0]     # non-zero overrides the backend default
+  remesh_mode: quadriflow            # quadriflow | voxel | decimate | none
+  voxel_resolution: 160              # voxels along the longest side
+  target_faces: 12000                # quad budget
+  smooth_iterations: 2
+  shrinkwrap: true                   # project the remesh back onto the AI surface
+  smooth_angle_deg: 35
+  boolean_union: true
+  nonuniform_fit: false              # true = force all three spec dimensions
+  # Stage 4 - UV / PBR
+  uv_method: smart                   # smart | seams | lightmap
+  uv_angle_limit_deg: 66
+  island_margin: 0.004
+  texture_size: 2048                 # 1024 | 2048 | 4096
+  bake_samples: 16
+  cage_extrusion_rel: 0.01
+  # Stage 6 - renders
+  render_engine: CYCLES              # CYCLES (headless-safe) | EEVEE | WORKBENCH
+  render_samples: 48
+  render_resolution: 1024
+  render_uv_checker: true
+
+# --- Stage 6: acceptance ----------------------------------------------------------
+audit:
+  max_iterations: 3
+  dimension_tolerance: 0.10          # primary axis
+  proportion_tolerance: 0.30         # other axes
+  require_watertight: true
+  max_uv_stretch: 0.45
+  max_self_intersections: 0
+  min_vision_score: 0.7
+  use_vision_llm: true
+  export_unapproved: true            # still export the best iteration (exit code 2)
