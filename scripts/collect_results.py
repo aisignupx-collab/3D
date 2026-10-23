@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """Bundle pipeline runs into one QA results archive.
 
-Collects, for every run under ``--runs``: the key metrics from manifest.json
-(spec, per-iteration audit, stage timings, template/blueprint fit, texture
-projection, rig landmarks and pose test, export), the concept sheet, final
-renders and the tail of every Blender log that reported an error. Adds an
-environment snapshot (OS, Python, GPU, Blender, key package versions) and
-writes ``summary.md`` + ``summary.json``, then zips everything.
+Collects, for every run under ``--runs``:
+  * the key metrics from manifest.json (spec, per-iteration audit, stage timings,
+    template/blueprint fit, texture projection, rig landmarks and pose test, export)
+    -> ``summary.json`` / ``summary.md``;
+  * the concept sheet, spec and manifest;
+  * the audit renders of every iteration (``renders/iter_N/*.png``, incl. posed views);
+  * the exported asset with its textures (``export/``; skip with ``--no-assets``);
+  * ``inspect_export.json`` from scripts/inspect_export.py when Blender is found;
+  * the tail of every Blender log that reported an error.
+Adds an environment snapshot (OS, Python, GPU, Blender, key package versions),
+then zips everything.
 
   python scripts/collect_results.py --runs output --out qa_results
 """
@@ -107,7 +112,13 @@ def main() -> int:
     ap.add_argument("--runs", nargs="+", default=["output"], help="run folders or parent folders of runs")
     ap.add_argument("--out", default="qa_results")
     ap.add_argument("--notes", help="optional file (e.g. the tester's report) to include")
+    ap.add_argument("--no-assets", action="store_true", help="skip exported asset files (smaller zip)")
     args = ap.parse_args()
+
+    from asset_pipeline.config import find_blender
+
+    blender = find_blender()
+    inspector = Path(__file__).resolve().parent / "inspect_export.py"
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -124,13 +135,25 @@ def main() -> int:
         summary["runs"].append(info)
         dest = out / "runs" / run.name
         dest.mkdir(parents=True, exist_ok=True)
-        for src in [run / "references" / "concept_sheet.png", run / "spec.json", run / "manifest.json",
-                    *sorted((run / "export" / "previews").glob("*.png"))]:
+        for src in [run / "references" / "concept_sheet.png", run / "spec.json", run / "manifest.json"]:
             if src.is_file():
                 shutil.copy2(src, dest / src.name)
-        posed = sorted((run / "renders").glob("iter_*/posed/*.png"))
-        for src in posed[-2:]:
-            shutil.copy2(src, dest / f"posed_{src.name}")
+        # Audit renders of every iteration (front/side/wireframe/shaded/uv_checker + posed/)
+        for src in sorted((run / "renders").glob("iter_*/**/*.png")):
+            rel = src.relative_to(run / "renders")
+            (dest / "renders" / rel.parent).mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dest / "renders" / rel)
+        export = (info.get("export") or {}).get("output")
+        if export and Path(export).is_file():
+            if not args.no_assets:
+                shutil.copytree(Path(export).parent, dest / "export", dirs_exist_ok=True,
+                                ignore=shutil.ignore_patterns("*.blend", "*.blend1"))
+            if blender:
+                report = dest / "inspect_export.json"
+                subprocess.run([blender, "--background", "--factory-startup", "--python", str(inspector), "--",
+                                export, "--json", str(report)], capture_output=True, timeout=600)
+                if report.is_file():
+                    info["inspect_warnings"] = json.loads(report.read_text(encoding="utf-8")).get("warnings")
         for log in sorted((run / "blender_jobs").glob("blender_*.log")):
             text = log.read_text(encoding="utf-8", errors="replace")
             if "Traceback" in text or "Error" in text:

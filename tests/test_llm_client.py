@@ -131,8 +131,8 @@ def test_unknown_provider():
 
 def test_presets_fill_url_and_key(monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "ds-key")
-    client = LLMClient("deepseek", "deepseek-chat", "http://localhost:11434")  # config default URL is replaced
-    assert client._openai_root() == "https://api.deepseek.com/v1" and client.api_key == "ds-key"
+    client = LLMClient("deepseek", "deepseek-flash", "http://localhost:11434")  # config default URL is replaced
+    assert client._openai_root() == "https://api.deepseek.com" and client.api_key == "ds-key"
     gemini = LLMClient("gemini", "gemini-2.5-flash")
     assert gemini._openai_root() == "https://generativelanguage.googleapis.com/v1beta/openai"
     assert LLMClient("openrouter", "x", "https://my-proxy/v1")._openai_root() == "https://my-proxy/v1"

@@ -168,6 +168,7 @@ GPU-backed OpenGL/EGL context.
 cp config.example.yaml config.yaml          # then edit
 python main.py --doctor                     # CUDA/VRAM, packages, TripoSR, Blender, LLM endpoints
 python main.py --dry_run --prompt "A functional MP5 submachine gun" --enable_rigging   # Blender stages only, no GPU
+pip install -r requirements-dev.txt          # pytest
 pytest                                       # unit tests; Blender tests run when Blender is found
 ```
 
@@ -193,7 +194,7 @@ pytest                                       # unit tests; Blender tests run whe
 | `--image_input PATH` | use this image instead of diffusion (prompt optional; the VLM names the object) |
 | `--target_format glb\|fbx\|obj` | export format (textures embedded in GLB/FBX, copied next to OBJ) |
 | `--enable_rigging` | Stage 5: part segmentation for props, armature + weights for characters/creatures |
-| `--rig_method rigify\|generated` | Rigify metarig, or a lightweight generated skeleton (19 bones biped) |
+| `--rig_method rigify\|generated` | Rigify metarig, or a lightweight generated 21-bone game skeleton |
 | `--print_clearance_mm N` | cut an N mm gap between segmented parts (3D printing) |
 | `--texture_resolution 1024\|2048\|4096` | bake resolution |
 | `--remesh_mode`, `--target_faces` | Stage 3 topology overrides |
@@ -327,15 +328,15 @@ vision auditor, local diffusion and 3D.
 |---|---|---|---|
 | `ollama` | local Ollama | - | `qwen2.5:14b-instruct`, `qwen2.5vl:7b` (vision) |
 | `lmstudio`, `vllm`, `openai_compatible` | local OpenAI-compatible servers | - | whatever you serve |
-| `deepseek` | DeepSeek API | `DEEPSEEK_API_KEY` | `deepseek-chat` (text only: planner) |
+| `deepseek` | DeepSeek API | `DEEPSEEK_API_KEY` | `deepseek-flash` (V4.1 Flash), `deepseek-v4-pro`. Use for the planner: DeepSeek's docs don't confirm image input |
 | `gemini` | Google Gemini (OpenAI endpoint) | `GEMINI_API_KEY` | `gemini-2.5-flash` (text + vision) |
-| `openrouter` | any hosted model, one key | `OPENROUTER_API_KEY` | `deepseek/deepseek-chat`, `openai/gpt-4.1`, `google/gemini-2.5-flash` |
+| `openrouter` | any hosted model, one key | `OPENROUTER_API_KEY` | `deepseek/deepseek-flash` (check the exact id on openrouter.ai), `openai/gpt-4.1`, `google/gemini-2.5-flash` |
 | `openai` | OpenAI | `OPENAI_API_KEY` | `gpt-4.1`, `gpt-4.1-mini` |
 | `anthropic` | Claude | `ANTHROPIC_API_KEY` | `claude-sonnet-5-5` |
 | `cli` | an agent CLI as the model | its own login | `command: "claude -p {prompt}"`, `"codex exec {prompt}"`, `"opencode run {prompt}"` |
 
 ```yaml
-llm:      {provider: deepseek, model: deepseek-chat}             # planner
+llm:      {provider: deepseek, model: deepseek-flash}            # planner
 vision:   {provider: gemini, model: gemini-2.5-flash}            # auditor needs image input
 # or keep everything local:
 # llm:    {provider: ollama, model: qwen2.5:14b-instruct}
@@ -343,7 +344,8 @@ vision:   {provider: gemini, model: gemini-2.5-flash}            # auditor needs
 ```
 
 Keys are read from environment variables (or the variable named in `api_key_env`), never from the
-config file. DeepSeek's API is text-only, so use it for `llm:`, not `vision:`. With `provider: cli`
+config file. DeepSeek's docs don't confirm image input for its Flash model, so use it for `llm:` and keep
+`vision:` on a model that accepts images. With `provider: cli`
 the prompt is passed as `{prompt}` (or on stdin) and images as file paths the agent opens itself.
 Agent CLIs may need permission flags to read files non-interactively (e.g.
 `claude -p --allowedTools Read {prompt}`). The JSON reply is extracted from whatever the agent prints.

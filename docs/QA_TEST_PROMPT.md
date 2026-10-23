@@ -87,6 +87,7 @@ Report the total install time and a 1-10 "how painful was it" score with reasons
 ## 4. Phase C: automated and smoke tests
 
 ```bash
+pip install -r requirements-dev.txt   # pytest is not in requirements.txt
 pytest -q                      # all tests; Blender tests run when Blender is found
 pytest -q -m blender -rA       # integration tests only, with per-test results
 python main.py --dry_run --prompt "A functional MP5 submachine gun" --enable_rigging --target_format fbx
@@ -166,7 +167,7 @@ Attach the screenshots you based the scores on, or reference the renders by path
    fallback). The run log should not say "unreachable". Check that the audit reports contain a
    `vision` section.
 2. **Cloud** (only with keys the owner provides through environment variables): rerun T02 and T07
-   with `llm: {provider: deepseek, model: deepseek-chat}` and
+   with `llm: {provider: deepseek, model: deepseek-flash}` and
    `vision: {provider: gemini, model: gemini-2.5-flash}`, or OpenRouter equivalents. Compare plan
    quality, audit quality, speed and errors against local.
 3. **`cli` provider:** if Claude Code, Codex or OpenCode is installed, set

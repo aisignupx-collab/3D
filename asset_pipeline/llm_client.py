@@ -73,7 +73,7 @@ def extract_json(text: str) -> Any:
 
 # OpenAI-wire-format services: provider -> (API root, default API-key env var)
 PRESETS = {
-    "deepseek": ("https://api.deepseek.com/v1", "DEEPSEEK_API_KEY"),  # deepseek-chat / deepseek-reasoner
+    "deepseek": ("https://api.deepseek.com", "DEEPSEEK_API_KEY"),  # deepseek-flash (V4.1 Flash), deepseek-v4-pro
     "gemini": ("https://generativelanguage.googleapis.com/v1beta/openai", "GEMINI_API_KEY"),  # gemini-*-flash
     "openrouter": ("https://openrouter.ai/api/v1", "OPENROUTER_API_KEY"),  # any hosted model, one key
     "lmstudio": ("http://localhost:1234/v1", ""),
@@ -106,6 +106,7 @@ class LLMClient:
             root, key_env = PRESETS[self.provider]
             if not self.base_url or self.base_url == OLLAMA_DEFAULT_URL:
                 self.base_url = root
+                self._root = root  # preset roots are complete; don't append /v1
             self.api_key = self.api_key or (os.environ.get(key_env, "") if key_env else "")
         elif self.provider == "cli":
             if not command:
@@ -224,6 +225,8 @@ class LLMClient:
         return data.get("message", {}).get("content", "")
 
     def _openai_root(self) -> str:
+        if getattr(self, "_root", None):
+            return self._root
         if self.base_url.endswith(("/v1", "/openai")):
             return self.base_url
         return f"{self.base_url}/v1"
