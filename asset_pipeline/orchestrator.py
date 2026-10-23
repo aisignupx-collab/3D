@@ -30,7 +30,7 @@ from .llm_client import LLMClient, LLMError
 from .mesh_reconstruction import MeshReconstructor
 from .reference_generator import ReferenceGenerator, ReferenceSet
 from .shape_templates import DEFAULT_MATERIALS, ShapeComponent, expand_arrays, recipe_for
-from .vision_auditor import AuditReport, VisionAuditor, apply_fixes
+from .vision_auditor import AuditReport, VisionAuditor, apply_fixes, apply_rig_fixes
 
 log = logging.getLogger(__name__)
 
@@ -57,6 +57,7 @@ class RunContext:
     spec: Optional[AssetSpec] = None
     references: Optional[ReferenceSet] = None
     raw_mesh: Optional[str] = None
+    raw_camera: Optional[Dict[str, Any]] = None  # reconstruction model's input camera (file coords)
     iterations: List[Dict[str, Any]] = field(default_factory=list)
     export: Optional[Dict[str, Any]] = None
     timings: Dict[str, float] = field(default_factory=dict)
@@ -72,6 +73,7 @@ class RunContext:
             "spec": self.spec.to_dict() if self.spec else None,
             "references": self.references.to_dict() if self.references else None,
             "raw_mesh": self.raw_mesh,
+            "raw_camera": self.raw_camera,
             "iterations": self.iterations,
             "export": self.export,
             "timings": self.timings,
@@ -164,6 +166,11 @@ class Pipeline:
         if data.get("references"):
             ctx.references = ReferenceSet(**data["references"])
         ctx.raw_mesh = data.get("raw_mesh")
+        ctx.raw_camera = data.get("raw_camera")
+        if ctx.raw_camera is None and ctx.raw_mesh and Path(ctx.raw_mesh).name == "raw_triposr.glb":
+            from .mesh_reconstruction import TripoSRBackend
+
+            ctx.raw_camera = TripoSRBackend.input_camera()  # runs from before cameras were recorded
         ctx.timings = data.get("timings", {})
         log.info("Resuming %s (spec=%s, raw_mesh=%s)", run_dir, bool(ctx.spec), ctx.raw_mesh)
         return ctx
@@ -200,7 +207,8 @@ class Pipeline:
             gen = ReferenceGenerator(self.cfg.diffusion, self.cfg.preprocess, self.cfg.reconstruction.device,
                                      self.cfg.pipeline.seed)
             ctx.references = gen.from_image(opts.image_input, ref_dir)
-        elif not opts.skip_references:
+        elif not opts.skip_references and self.cfg.reconstruction.backend != "primitive":
+            # (the placeholder backend needs no images, so diffusion is skipped for it)
             gen = ReferenceGenerator(self.cfg.diffusion, self.cfg.preprocess, self.cfg.reconstruction.device,
                                      self.cfg.pipeline.seed)
             ctx.references = gen.from_text(spec, ref_dir)
@@ -225,16 +233,30 @@ class Pipeline:
             if self.cfg.pipeline.unload_models_between_stages:
                 recon.unload()
         ctx.raw_mesh = raw.path
+        ctx.raw_camera = raw.camera
         self._timed(ctx, "stage2_reconstruct", start)
 
     # ----------------------------------------------------------- stages 3-6
 
-    def _cleanup_params(self, spec: AssetSpec) -> Dict[str, Any]:
+    def _cleanup_params(self, spec: AssetSpec, camera: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         params = dataclasses.asdict(self.cfg.cleanup)
         params["target_faces"] = params["target_faces"] or spec.face_budget or 12000
+        if spec.is_organic:
+            params["max_tilt_correction"] = 0.0  # yaw only: an A-pose body has no upright min box
         params.update(name=spec.name, dimensions=spec.dimensions, fit_dimension=spec.fit_dimension,
-                      axis_scale={})
+                      axis_scale={}, reference_camera=camera,
+                      symmetrize=spec.is_organic and params.pop("symmetrize_characters"))
+        params.pop("symmetrize_characters", None)
         return params
+
+    @staticmethod
+    def _mirror_axes(spec: AssetSpec) -> List[str]:
+        """Symmetry planes safe for filling unseen faces from the reference image."""
+        if spec.is_organic:
+            return ["X"]  # left/right only - never paint the face onto the back of the head
+        if spec.category in ELONGATED:
+            return ["Y"]  # left/right flank - never swap muzzle and stock
+        return ["X", "Y"]
 
     def _shape_components(self, spec: AssetSpec) -> Optional[List[Dict[str, Any]]]:
         """Template recipe for Stage 3b: planner shapes > library recipe > [] (auto-classify).
@@ -244,8 +266,7 @@ class Pipeline:
         if self.cfg.shapes.mode == "mesh" or spec.is_organic:
             return None
         comps = spec.shapes or [c.to_dict() for c in recipe_for(spec.prompt, spec.category)]
-        if not comps and spec.category in ELONGATED:
-            # A single box/cylinder guess would erase a weapon's or vehicle's detail
+        if not comps and spec.category in ELONGATED and not self.cfg.shapes.blueprint:
             return None
         return [c.to_dict() for c in expand_arrays([ShapeComponent(**c) for c in comps])]
 
@@ -272,6 +293,9 @@ class Pipeline:
                 input_blend=blend, output_blend=out, components=components, mode=shapes.mode,
                 recipe_max_error=shapes.recipe_max_error, classify_max_error=shapes.classify_max_error,
                 union=shapes.union, refine=shapes.refine, materials=materials,
+                # A single box/cylinder guess would erase a weapon's or vehicle's detail
+                classify=spec.category not in ELONGATED, blueprint=shapes.blueprint,
+                blueprint_max_error=shapes.blueprint_max_error, blueprint_resolution=shapes.blueprint_resolution,
                 parts=[dataclasses.asdict(p) for p in spec.parts],
                 default_material=max(spec.materials, key=lambda m: m.coverage).name if spec.materials else "",
                 auto_smooth_angle=self.cfg.cleanup.auto_smooth_angle, seed=self.cfg.pipeline.seed,
@@ -288,8 +312,15 @@ class Pipeline:
                      result.get("source"), result.get("fit_error", -1))
         return result
 
-    def _texture_params(self, spec: AssetSpec, refs: Optional[ReferenceSet]) -> Dict[str, Any]:
+    def _texture_params(self, spec: AssetSpec, refs: Optional[ReferenceSet],
+                        camera: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         params = dataclasses.asdict(self.cfg.texture)
+        primary = None
+        if refs is not None:
+            primary = next((v for v in refs.views.values() if v.get("prepared") == refs.primary), None)
+        params["reference_image"] = (primary or {}).get("projection")
+        params["reference_camera"] = camera
+        params["mirror_axes"] = self._mirror_axes(spec) if params.pop("mirror_fill") else []
         params["materials"] = self._materials(spec, self._shape_components(spec))
         projections = []
         if refs and params["albedo_source"] == "projection":
@@ -308,13 +339,15 @@ class Pipeline:
         spec = ctx.spec
         runner = self.blender(ctx.run_dir)
         auditor = VisionAuditor(self.vlm, self.cfg.pipeline.approval_score)
-        cleanup = self._cleanup_params(spec)
-        texture = self._texture_params(spec, ctx.references)
+        cleanup = self._cleanup_params(spec, ctx.raw_camera)
+        texture = self._texture_params(spec, ctx.references, ctx.raw_camera)
         reference_image = ctx.references.concept_sheet if ctx.references else None
         stage5_mode = self._stage5_mode(ctx)
         located_parts = None
         prev_cleanup, prev_geometry, shape_result = None, None, {}
         components = self._shape_components(spec)
+        rig = {"method": ctx.options.rig_method, "weights": "auto", "weight_smooth": 1, "max_influences": 4,
+               "pose_test": True}
         ctx.iterations = []
 
         for it in range(1, max(1, self.cfg.pipeline.max_iterations) + 1):
@@ -385,8 +418,9 @@ class Pipeline:
                 log.info("STAGE 5 - %s rig (%s)", spec.rig_type, ctx.options.rig_method)
                 final_blend = str(it_dir / "stage5_rigged.blend")
                 record["stage5"] = runner.run("rig", dict(
-                    input_blend=s4_blend, output_blend=final_blend, rig_type=spec.rig_type,
-                    method=ctx.options.rig_method), tag=f"it{it}_rig")
+                    rig, input_blend=s4_blend, output_blend=final_blend, rig_type=spec.rig_type),
+                    tag=f"it{it}_rig")
+                record["rig_params"] = rig
                 self._timed(ctx, "stage5_rigging", start)
 
             # STAGE 6
@@ -398,8 +432,19 @@ class Pipeline:
                 samples=self.cfg.render.samples, include_uv_checker=self.cfg.render.include_uv_checker,
                 use_gpu=self.cfg.blender.use_gpu), tag=f"it{it}_render")
             assembled = [round(b - a, 4) for a, b in zip(render["bbox_min"], render["bbox_max"])]
-            report: AuditReport = auditor.audit(it, render["renders"], render["metrics"], spec,
-                                                cleanup["target_faces"], reference_image, assembled)
+            renders = dict(render["renders"])
+            rig_report = record.get("stage5") if stage5_mode == "rig" else None
+            if rig_report and rig_report.get("posed_blend"):
+                posed = runner.run("render", dict(
+                    input_blend=rig_report["posed_blend"],
+                    output_dir=str(ctx.run_dir / "renders" / f"iter_{it}" / "posed"),
+                    resolution=self.cfg.render.resolution, engine=self.cfg.render.engine,
+                    samples=self.cfg.render.samples, views=["front", "shaded"], use_gpu=self.cfg.blender.use_gpu),
+                    tag=f"it{it}_render_posed")
+                renders.update({f"posed_{k}": v for k, v in posed["renders"].items()})
+                render["renders"] = renders
+            report: AuditReport = auditor.audit(it, renders, render["metrics"], spec,
+                                                cleanup["target_faces"], reference_image, assembled, rig_report)
             record.update(render=render, audit=report.to_dict(), final_blend=final_blend)
             self._timed(ctx, "stage6_audit", start)
             ctx.iterations.append(record)
@@ -412,6 +457,8 @@ class Pipeline:
                 log.warning("Not approved after %d iterations; exporting best attempt", it)
                 break
             cleanup, texture, changes = apply_fixes(cleanup, texture, report.issues)
+            rig, rig_changes = apply_rig_fixes(rig, report.issues)
+            changes += rig_changes
             record["fixes"] = changes
             if not changes:
                 log.warning("Audit found no actionable fixes; stopping refinement")

@@ -40,6 +40,7 @@ FIX_ACTIONS: Dict[str, str] = {
     "reduce_faces": "polycount above budget: lower the face target",
     "reunwrap": "UV stretching, distorted checker squares: re-unwrap with more islands",
     "rebake": "texture smearing, black patches or baking artefacts: widen the bake cage and margin",
+    "reweight": "rigged character tears, collapses or stretches at joints in the posed views: re-skin",
 }
 
 SEVERITY_PENALTY = {"low": 0.03, "medium": 0.12, "high": 0.3}
@@ -198,8 +199,10 @@ class VisionAuditor:
         face_budget: int,
         reference_image: Optional[str] = None,
         assembled_dims: Optional[Sequence[float]] = None,
+        rig_report: Optional[Dict[str, Any]] = None,
     ) -> AuditReport:
         issues = check_metrics(metrics, spec, face_budget, assembled_dims)
+        issues.extend(check_rig(rig_report))
         vision, vision_error = None, None
         if self.llm is not None:
             try:
@@ -226,7 +229,8 @@ class VisionAuditor:
         return report
 
     def _vision_review(self, renders, metrics, spec, reference_image) -> Dict[str, Any]:
-        order = [v for v in ("front", "side", "wireframe", "shaded", "uv_checker") if v in renders]
+        order = [v for v in ("front", "side", "wireframe", "shaded", "uv_checker", "posed_front", "posed_shaded")
+                 if v in renders]
         images = [renders[v] for v in order]
         captions = {
             "front": "orthographic front view (looking along +Y, X horizontal, Z up)",
@@ -234,6 +238,8 @@ class VisionAuditor:
             "wireframe": "perspective view, clay material with wireframe overlay (topology)",
             "shaded": "perspective view with final PBR materials",
             "uv_checker": "perspective view with a UV checker texture (squares should be even and square)",
+            "posed_front": "rigged character in a test pose (arms raised, elbows/knees bent, torso twisted), front",
+            "posed_shaded": "the same test pose, perspective view",
         }
         lines = [f"{i + 1}. {captions[v]}" for i, v in enumerate(order)]
         if reference_image and Path(reference_image).is_file():
@@ -344,6 +350,38 @@ def remap_point(point, old_lo, old_hi, new_lo, new_hi) -> List[float]:
 # ---------------------------------------------------------------------------
 # Corrective feedback
 # ---------------------------------------------------------------------------
+
+def check_rig(rig_report: Optional[Dict[str, Any]], limit: float = 0.03) -> List[Issue]:
+    """Pose-test deformation and skin coverage from Stage 5 rigging."""
+    if not rig_report:
+        return []
+    issues = []
+    if rig_report.get("weight_coverage", 1.0) < 0.99:
+        issues.append(Issue("rig", "high", f"{1 - rig_report['weight_coverage']:.1%} of vertices have no skin weights",
+                            "reweight"))
+    bad = (rig_report.get("pose_test") or {}).get("bad_edge_fraction")
+    if bad is not None and bad > limit:
+        issues.append(Issue("rig", "high" if bad > 3 * limit else "medium",
+                            f"pose test: {bad:.1%} of edges stretch >1.6x or collapse <0.55x", "reweight"))
+    missing = (rig_report.get("landmarks") or {}).get("fallback") or []
+    if missing:
+        issues.append(Issue("rig", "low", f"joints placed by proportion, not detected: {', '.join(missing)}"))
+    return issues
+
+
+def apply_rig_fixes(rig: Dict[str, Any], issues: Sequence[Issue]) -> Tuple[Dict[str, Any], List[str]]:
+    """``reweight`` escalation: more weight smoothing, then distance-based skinning."""
+    r = copy.deepcopy(rig)
+    if not any(i.fix == "reweight" for i in issues):
+        return r, []
+    if r.get("weight_smooth", 1) < 4:
+        r["weight_smooth"] = r.get("weight_smooth", 1) + 2
+        return r, [f"weight_smooth -> {r['weight_smooth']}"]
+    if r.get("weights", "auto") != "proximity":
+        r["weights"] = "proximity"
+        return r, ["weights -> proximity"]
+    return r, []
+
 
 def apply_fixes(cleanup: Dict[str, Any], texture: Dict[str, Any],
                 issues: Sequence[Issue]) -> Tuple[Dict[str, Any], Dict[str, Any], List[str]]:

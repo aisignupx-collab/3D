@@ -444,9 +444,12 @@ def _hull_points(obj, limit: int = 4000) -> "np.ndarray":
     return pts - pts.mean(axis=0)
 
 
-def _min_volume_rotation(pts, center, span, step):
+def _min_volume_rotation(pts, center, span, step, tilt=True):
     grid = np.arange(-span, span + 1e-9, step)
-    angles = np.stack(np.meshgrid(grid, grid, grid, indexing="ij"), -1).reshape(-1, 3) + center
+    if tilt:
+        angles = np.stack(np.meshgrid(grid, grid, grid, indexing="ij"), -1).reshape(-1, 3) + center
+    else:  # yaw only
+        angles = np.stack([np.zeros_like(grid), np.zeros_like(grid), grid], -1) + center
     rotated = np.einsum("nij,pj->npi", _euler_matrices(angles), pts)
     volume = np.prod(rotated.max(axis=1) - rotated.min(axis=1), axis=1)
     # Tie-break towards the smallest rotation: symmetric shapes have many equal minima
@@ -465,9 +468,12 @@ def align_to_axes(obj, max_tilt: float = 45.0, longest_to_x: bool = True):
     horizontal extent is then turned onto X (weapons, vehicles, walls).
     """
     pts = _hull_points(obj)
-    best = _min_volume_rotation(pts, np.zeros(3), max_tilt, 5.0)
-    best = _min_volume_rotation(pts, best, 5.0, 1.0)
-    best = _min_volume_rotation(pts, best, 1.0, 0.25)
+    # max_tilt <= 0: yaw only. Bodies in A-pose do not have an upright minimum box, so
+    # characters keep the reconstruction's up axis and are only turned about Z.
+    tilt = max_tilt > 0
+    best = _min_volume_rotation(pts, np.zeros(3), max_tilt if tilt else 45.0, 5.0, tilt)
+    best = _min_volume_rotation(pts, best, 5.0, 1.0, tilt)
+    best = _min_volume_rotation(pts, best, 1.0, 0.25, tilt)
     rx, ry, rz = (float(v) for v in best)
     if longest_to_x:
         rotated = pts @ _euler_matrices(best[None])[0].T
@@ -485,6 +491,21 @@ def align_to_axes(obj, max_tilt: float = 45.0, longest_to_x: bool = True):
     return [round(rx, 2), round(ry, 2), round(rz, 2)]
 
 
+def front_facing_yaw(camera, frame, keep_long_axis: bool) -> float:
+    """Yaw (multiple of 90, or of 180 to keep X as the long axis) that puts the camera at -Y."""
+    pos = np.asarray(camera["position"], float)
+    if camera.get("coords") == "gltf":
+        pos = np.array(GLTF_TO_BLENDER) @ pos
+    x, y = (frame @ np.append(pos, 1.0))[:2]
+    best, best_y = 0.0, None
+    for yaw in ((0.0, 180.0) if keep_long_axis else (0.0, 90.0, 180.0, 270.0)):
+        c, s = math.cos(math.radians(yaw)), math.sin(math.radians(yaw))
+        ry = s * x + c * y
+        if best_y is None or ry < best_y - 1e-9:
+            best, best_y = yaw, ry
+    return best
+
+
 def ground_and_center(obj, followers=()):
     """Centre on XY, rest on Z=0; ``followers`` get the same translation."""
     lo, hi = bbox([obj])
@@ -493,6 +514,19 @@ def ground_and_center(obj, followers=()):
     for o in (obj, *followers):
         o.location = offset
         apply_transforms(o)
+    return offset
+
+
+def _translation(offset) -> "np.ndarray":
+    m = np.eye(4)
+    m[:3, 3] = offset
+    return m
+
+
+def _linear(mat3) -> "np.ndarray":
+    m = np.eye(4)
+    m[:3, :3] = mat3
+    return m
 
 
 def fit_scale(obj, target_dims, fit_dimension: str, axis_scale: dict):
@@ -514,7 +548,7 @@ def fit_scale(obj, target_dims, fit_dimension: str, axis_scale: dict):
     dims = hi - lo
     error = [round(float(d / t - 1.0), 4) if t > 0 else 0.0 for d, t in zip(dims, target_dims)]
     log(f"scale: x{factor:.4f}, dims {np.round(dims, 3).tolist()} vs target {target_dims}")
-    return {"scale_factor": factor, "dimension_error": error}
+    return {"scale_factor": factor, "scale_vector": scale, "dimension_error": error}
 
 
 def union_islands(obj):
@@ -610,10 +644,14 @@ def op_cleanup(p: dict) -> dict:
     reset_scene()
     raw = import_mesh(p["input_mesh"])
     raw.name = "raw_import"
+    # ``frame`` maps imported-file coordinates to the final asset frame; Stage 4 uses it to
+    # place the reconstruction model's input camera for reference-image projection.
+    frame = np.eye(4)
     rot = p.get("import_rotation_deg") or [0, 0, 0]
     if any(rot):
         raw.rotation_euler = [math.radians(a) for a in rot]
         apply_transforms(raw)
+        frame = _linear(_euler_matrices(np.array([rot], float))[0]) @ frame
     raw_faces = face_count(raw)
 
     lo, hi = bbox([raw])
@@ -624,9 +662,19 @@ def op_cleanup(p: dict) -> dict:
     report["rotation_applied_deg"] = align_to_axes(
         raw, max_tilt=float(p.get("max_tilt_correction", 45.0)),
         longest_to_x=p.get("orient_longest_axis", True)) if p.get("auto_orient", True) else [0.0, 0.0, 0.0]
-    ground_and_center(raw)
+    frame = _linear(_euler_matrices(np.array([report["rotation_applied_deg"]], float))[0]) @ frame
+    if p.get("reference_camera") and p.get("auto_orient", True):
+        # The side the reference image shows is the asset's front: turn it to face -Y
+        yaw = front_facing_yaw(p["reference_camera"], frame, keep_long_axis=p.get("orient_longest_axis", True))
+        if yaw:
+            raw.rotation_euler = (0.0, 0.0, math.radians(yaw))
+            apply_transforms(raw)
+            frame = _linear(_euler_matrices(np.array([[0.0, 0.0, yaw]], float))[0]) @ frame
+        report["front_yaw_deg"] = yaw
+    frame = _translation(ground_and_center(raw)) @ frame
     report.update(fit_scale(raw, p["dimensions"], p["fit_dimension"], p.get("axis_scale")))
-    ground_and_center(raw)
+    frame = _linear(np.diag(report["scale_vector"])) @ frame
+    frame = _translation(ground_and_center(raw)) @ frame
     lo, hi = bbox([raw])
     size = float((hi - lo).max())
 
@@ -647,6 +695,16 @@ def op_cleanup(p: dict) -> dict:
     voxel_size = size / max(16, int(p["voxel_resolution"]))
     target_faces = int(p["target_faces"])
 
+    if p.get("symmetrize"):
+        # Characters: mirror the better-reconstructed +X half onto -X. Clean symmetric
+        # topology gives symmetric skin weights and hides one-sided reconstruction errors.
+        select_only(obj)
+        set_mode("EDIT")
+        bpy.ops.mesh.select_all(action="SELECT")
+        bpy.ops.mesh.symmetrize(direction="POSITIVE_X", threshold=1e-4 * size)
+        set_mode("OBJECT")
+        report["symmetrized"] = True
+
     if mode in ("decimate", "none") and p.get("fix_intersections") and report["collisions_before"]:
         obj = union_islands(obj)
         obj.name = p["name"]
@@ -656,6 +714,8 @@ def op_cleanup(p: dict) -> dict:
         # Quadriflow needs a manifold input; voxel remesh guarantees one and also
         # unions intersecting shells.
         voxel_remesh(obj, voxel_size)
+        # Quadriflow time grows with input size; a dense voxel shell gains nothing past ~20x target
+        decimate_to(obj, target_faces * 20, passes=1)
         if quadriflow(obj, target_faces):
             shrinkwrap_to(obj, high)
             report["remesh"] = "quadriflow"
@@ -682,7 +742,9 @@ def op_cleanup(p: dict) -> dict:
     smooth(obj, int(p.get("smooth_iterations", 0)))
     auto_smooth(obj, float(p.get("auto_smooth_angle", 40.0)))
     report["collisions_after"] = island_collisions(obj)
-    ground_and_center(obj, followers=[high])  # bake source must stay in the target's frame
+    frame = _translation(ground_and_center(obj, followers=[high])) @ frame  # bake source stays aligned
+    report["frame_matrix"] = frame.round(8).tolist()
+    bpy.context.scene["frame_matrix"] = [float(v) for v in frame.ravel()]
     report["metrics"] = mesh_metrics(obj)
     save_blend(p["output_blend"])
     log(f"cleanup done: {report['metrics']['faces']} faces, watertight={report['metrics']['watertight']}")
@@ -947,6 +1009,205 @@ def subtract_objects(base, cutters):
         bpy.data.objects.remove(o, do_unlink=True)
 
 
+# ----------------------------------------------------------------- three-view blueprint
+#
+# Hard-surface objects without a recipe (guns, tools, machinery) are rebuilt the
+# way artists block them out from blueprints: trace the side, top and front
+# silhouettes, extrude each through the asset and keep their intersection (a
+# visual hull). Edges come out straight and crisp, holes such as a trigger-guard
+# opening survive, and no primitive vocabulary is needed.
+
+BLUEPRINT_VIEWS = {  # view: (u axis, v axis, extrusion axis)
+    "side": (0, 2, 1),   # X-Z profile, extruded along Y
+    "top": (0, 1, 2),    # X-Y plan, extruded along Z
+    "front": (1, 2, 0),  # Y-Z section, extruded along X
+}
+
+
+def _components(mask, connectivity4=True):
+    """Label connected True regions; returns (labels, sizes) with labels 1..n."""
+    h, w = mask.shape
+    labels = np.zeros((h, w), np.int32)
+    sizes = [0]
+    for sy, sx in np.argwhere(mask):
+        if labels[sy, sx]:
+            continue
+        n = len(sizes)
+        stack = [(sy, sx)]
+        labels[sy, sx] = n
+        count = 0
+        while stack:
+            y, x = stack.pop()
+            count += 1
+            for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                ny, nx = y + dy, x + dx
+                if 0 <= ny < h and 0 <= nx < w and mask[ny, nx] and not labels[ny, nx]:
+                    labels[ny, nx] = n
+                    stack.append((ny, nx))
+        sizes.append(count)
+    return labels, sizes
+
+
+def silhouette_mask(pts, axes, origin, cell, shape, close_r=2, min_hole_cells=12):
+    """Rasterise points onto the (u, v) plane, close gaps, drop specks and pinholes."""
+    u_ax, v_ax = axes
+    mask = np.zeros(shape, bool)
+    j = ((pts[:, u_ax] - origin[0]) / cell).astype(int)
+    i = ((pts[:, v_ax] - origin[1]) / cell).astype(int)
+    ok = (i >= 0) & (i < shape[0]) & (j >= 0) & (j < shape[1])
+    mask[i[ok], j[ok]] = True
+    mask = _erode(_dilate(mask, close_r), close_r)
+    labels, sizes = _components(mask)
+    if len(sizes) > 1:
+        largest = max(sizes[1:])
+        mask = np.isin(labels, [k for k, n in enumerate(sizes) if k and n >= 0.02 * largest])
+    holes, hsizes = _components(~mask)
+    border = set(np.unique(np.concatenate([holes[0], holes[-1], holes[:, 0], holes[:, -1]])).tolist())
+    for k, n in enumerate(hsizes):
+        if k and k not in border and n < min_hole_cells:
+            mask[holes == k] = True  # sampling pinholes; real openings are larger
+    return mask
+
+
+def boundary_loops(mask):
+    """Closed pixel-corner loops around True regions (outer CCW, holes CW)."""
+    h, w = mask.shape
+    pad = np.zeros((h + 2, w + 2), bool)
+    pad[1:-1, 1:-1] = mask
+    out = {}
+    for y, x in np.argwhere(mask):
+        py, px = y + 1, x + 1
+        if not pad[py - 1, px]:
+            out.setdefault((x, y), []).append((x + 1, y))
+        if not pad[py, px + 1]:
+            out.setdefault((x + 1, y), []).append((x + 1, y + 1))
+        if not pad[py + 1, px]:
+            out.setdefault((x + 1, y + 1), []).append((x, y + 1))
+        if not pad[py, px - 1]:
+            out.setdefault((x, y + 1), []).append((x, y))
+    loops = []
+    while out:
+        start = next(iter(out))
+        loop, cur, prev_dir = [start], start, None
+        while True:
+            options = out[cur]
+            if len(options) == 1 or prev_dir is None:
+                nxt = options[0]
+            else:
+                # Diagonal contact: turn left so regions stay 4-connected and loops never cross
+                def turn(o):
+                    d = (o[0] - cur[0], o[1] - cur[1])
+                    return prev_dir[0] * d[1] - prev_dir[1] * d[0]
+                nxt = max(options, key=turn)
+            options.remove(nxt)
+            if not options:
+                del out[cur]
+            prev_dir = (nxt[0] - cur[0], nxt[1] - cur[1])
+            cur = nxt
+            if cur == start:
+                break
+            loop.append(cur)
+        if len(loop) >= 4:
+            loops.append(np.array(loop, float))
+    return loops
+
+
+def _dp(points, eps):
+    """Douglas-Peucker on an open polyline (inclusive endpoints)."""
+    if len(points) < 3:
+        return points
+    a, b = points[0], points[-1]
+    ab = b - a
+    norm = np.linalg.norm(ab)
+    if norm < 1e-12:
+        d = np.linalg.norm(points - a, axis=1)
+    else:
+        d = np.abs(ab[0] * (points[:, 1] - a[1]) - ab[1] * (points[:, 0] - a[0])) / norm
+    k = int(np.argmax(d))
+    if d[k] <= eps:
+        return np.vstack([a, b])
+    return np.vstack([_dp(points[:k + 1], eps)[:-1], _dp(points[k:], eps)])
+
+
+def simplify_loop(loop, eps):
+    far = int(np.argmax(np.linalg.norm(loop - loop[0], axis=1)))
+    first = _dp(np.vstack([loop[:far + 1]]), eps)
+    second = _dp(np.vstack([loop[far:], loop[:1]]), eps)
+    out = np.vstack([first[:-1], second[:-1]])
+    return out if len(out) >= 3 else loop
+
+
+def prism_object(name, loops, axes, extrude_axis, origin, cell, depth_lo, depth_hi):
+    """Fill the (simplified) loops - holes included - and extrude through the asset."""
+    u_ax, v_ax = axes
+    bm = bmesh.new()
+    edges = []
+    for loop in loops:
+        verts = []
+        for x, y in loop:
+            co = [0.0, 0.0, 0.0]
+            co[u_ax] = origin[0] + x * cell
+            co[v_ax] = origin[1] + y * cell
+            co[extrude_axis] = depth_lo
+            verts.append(bm.verts.new(co))
+        edges += [bm.edges.new((verts[i], verts[(i + 1) % len(verts)])) for i in range(len(verts))]
+    normal = [0.0, 0.0, 0.0]
+    normal[extrude_axis] = 1.0
+    faces = bmesh.ops.triangle_fill(bm, use_beauty=True, use_dissolve=False, edges=edges, normal=normal)["geom"]
+    faces = [f for f in faces if isinstance(f, bmesh.types.BMFace)]
+    ext = bmesh.ops.extrude_face_region(bm, geom=faces)
+    shift = [0.0, 0.0, 0.0]
+    shift[extrude_axis] = depth_hi - depth_lo
+    bmesh.ops.translate(bm, vec=shift, verts=[v for v in ext["geom"] if isinstance(v, bmesh.types.BMVert)])
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+    me = bpy.data.meshes.new(name)
+    bm.to_mesh(me)
+    bm.free()
+    obj = bpy.data.objects.new(name, me)
+    bpy.context.scene.collection.objects.link(obj)
+    return obj
+
+
+def build_blueprint(scan, lo, hi, resolution=256, rng=None, views=("side", "top", "front")):
+    """Visual hull of the scan's orthographic silhouettes. Returns (object, info)."""
+    rng = rng or np.random.default_rng(0)
+    pts = sample_surface(scan, 250000, rng)
+    size = hi - lo
+    cell = float(size.max()) / resolution
+    pad = 4
+    info = {}
+    prisms = []
+    for view in views:
+        u_ax, v_ax, e_ax = BLUEPRINT_VIEWS[view]
+        origin = (lo[u_ax] - pad * cell, lo[v_ax] - pad * cell)
+        shape = (int(math.ceil(size[v_ax] / cell)) + 2 * pad, int(math.ceil(size[u_ax] / cell)) + 2 * pad)
+        mask = silhouette_mask(pts, (u_ax, v_ax), origin, cell, shape)
+        loops = [simplify_loop(lp, 0.75) for lp in boundary_loops(mask)]
+        info[view] = {"loops": len(loops), "vertices": int(sum(len(lp) for lp in loops)),
+                      "fill": round(float(mask.mean()), 3)}
+        margin = 0.02 * float(size.max())
+        prisms.append(prism_object(f"blueprint_{view}", loops, (u_ax, v_ax), e_ax, origin, cell,
+                                   lo[e_ax] - margin, hi[e_ax] + margin))
+    base = prisms[0]
+    for other in prisms[1:]:
+        mod = base.modifiers.new("hull", "BOOLEAN")
+        mod.operation = "INTERSECT"
+        mod.solver = "EXACT"
+        mod.object = other
+        apply_modifier(base, mod)
+        bpy.data.objects.remove(other, do_unlink=True)
+    bm = bmesh.new()
+    bm.from_mesh(base.data)
+    bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=cell * 0.05)
+    bmesh.ops.dissolve_limit(bm, angle_limit=math.radians(1.0), verts=bm.verts, edges=bm.edges)
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+    bm.to_mesh(base.data)
+    bm.free()
+    base.name = "blueprint"
+    info["faces"] = face_count(base)
+    return base, info
+
+
 CLASSIFY_CANDIDATES = [
     {"type": "box", "bevel": 0.03}, {"type": "cylinder", "axis": "Z"}, {"type": "cylinder", "axis": "X"},
     {"type": "cylinder", "axis": "Y"}, {"type": "cone", "axis": "+Z", "taper": 0.0},
@@ -987,6 +1248,10 @@ def op_primitives(p: dict) -> dict:
             refine_components(comps, (world_coords(scan) - lo) / size)
         report["source"] = "recipe"
         limit = float(p.get("recipe_max_error", 0.12))
+    elif not p.get("classify", True):
+        comps = []
+        report["source"] = "blueprint"
+        limit = float(p.get("blueprint_max_error", 0.05))
     else:
         scores = {}
         for cand in CLASSIFY_CANDIDATES:
@@ -1001,12 +1266,24 @@ def op_primitives(p: dict) -> dict:
         report.update(source=f"classified:{best_key}", candidates=dict(sorted(scores.items(), key=lambda kv: kv[1])))
         limit = float(p.get("classify_max_error", 0.035))
         log(f"primitives: best single-shape fit {best_key} ({scores[best_key]:.4f}); ranking {report['candidates']}")
+        if scores[best_key] > limit and p.get("blueprint", True):
+            comps, report["source"] = [], "blueprint"  # no clean single shape: try the blueprint hull
+            limit = float(p.get("blueprint_max_error", 0.05))
+
+    if report["source"] == "blueprint":
+        hull, info = build_blueprint(scan, lo, hi, int(p.get("blueprint_resolution", 256)), rng)
+        report["blueprint"] = info
+        built = {"": hull}
+        if materials:
+            hull.data.materials.append(slots[p.get("default_material") or next(iter(materials))])
+    else:
+        built = None
 
     # Build groups: body ("" part) and one group per part name
     groups = {}
     for c in comps:
         groups.setdefault(c.get("part") or "", []).append(c)
-    built = {}
+    built = built if built is not None else {}
     for part_name, members in groups.items():
         unions = [component_object(c, lo, size, slots) for c in members if c.get("operation", "union") == "union"]
         cutters = [component_object(c, lo, size, slots) for c in members if c.get("operation") == "subtract"]
@@ -1320,7 +1597,16 @@ def bake_material_ids(objs, res, names, bake_all):
     return np.clip(ids, -1, n - 1)
 
 
-def derive_pbr(albedo_img, rough_img, metal_img, materials, ids=None):
+def _colour_features(rgb):
+    """(..., 3) sRGB -> (hue * saturation as 2D vector, scaled value) for material matching."""
+    mx, mn = rgb.max(axis=-1), rgb.min(axis=-1)
+    sat = np.where(mx > 1e-4, (mx - mn) / np.maximum(mx, 1e-4), 0.0)
+    r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+    hue = np.arctan2(np.sqrt(3.0) * (g - b), 2 * r - g - b)
+    return np.stack([np.cos(hue) * sat * 2.0, np.sin(hue) * sat * 2.0, mx * 0.6], axis=-1)
+
+
+def derive_pbr(albedo_img, rough_img, metal_img, materials, ids=None, reliable=None):
     """Material-ID per texel (template IDs, else nearest spec colour), then roughness/metallic.
 
     Roughness gets a small luminance-driven variation so surfaces read as
@@ -1330,8 +1616,16 @@ def derive_pbr(albedo_img, rough_img, metal_img, materials, ids=None):
     albedo = image_to_array(albedo_img)
     rgb = albedo[..., :3]
     palette = np.array([srgb_from_linear(m["base_color"]) for m in materials], dtype=np.float32)
-    dist = ((rgb[:, :, None, :] - palette[None, None, :, :]) ** 2).sum(axis=-1)
+    # Compare hue/saturation first and brightness only weakly: shadowed wood is dark but still
+    # saturated, bare metal is unsaturated at any brightness.
+    feat_px, feat_pal = _colour_features(rgb), _colour_features(palette)
+    dist = ((feat_px[:, :, None, :] - feat_pal[None, None, :, :]) ** 2).sum(axis=-1)
     colour_ids = dist.argmin(axis=-1)
+    if reliable is not None:
+        # Unseen texels carry the reconstruction's blurry, desaturated colours, which read as
+        # bare metal; give them the dominant material instead of a guess.
+        dominant = int(np.argmax([m.get("coverage", 1.0) for m in materials]))
+        colour_ids = np.where(reliable, colour_ids, dominant)
     # Template materials are authoritative; colour clustering only fills unknown texels
     ids = colour_ids if ids is None else np.where(ids >= 0, ids, colour_ids)
     rough_vals = np.array([m["roughness"] for m in materials], dtype=np.float32)
@@ -1386,6 +1680,230 @@ def save_image(img, path: Path):
     img.filepath_raw = str(path.resolve())
     img.file_format = "PNG"
     img.save()
+
+
+# ----------------------------------------------------------------- reference projection
+#
+# The sharpest colour information is the reference image itself, not the
+# reconstruction's vertex colours. We find the camera that image was taken
+# from (the reconstruction model's canonical input camera, refined so the
+# scan's silhouette matches the image's alpha), then re-project the image onto
+# every texel that camera can actually see.
+
+GLTF_TO_BLENDER = [[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]]  # (x, y, z)gltf -> (x, -z, y)
+
+
+def _cam_basis(cam):
+    pos, target, up = (np.asarray(cam[k], float) for k in ("position", "target", "up"))
+    f = target - pos
+    f /= np.linalg.norm(f)
+    r = np.cross(f, up)
+    r /= np.linalg.norm(r)
+    return pos, r, np.cross(r, f), f
+
+
+def project_to_image(pts, cam):
+    """World points -> (u, v) with v measured from the top of the image, and depth."""
+    pos, r, u_axis, f = _cam_basis(cam)
+    d = pts - pos
+    z = d @ f
+    t = 2.0 * math.tan(math.radians(cam["fov_deg"]) / 2.0)
+    z_safe = np.where(np.abs(z) < 1e-9, 1e-9, z)
+    sx, sy = cam.get("shift", (0.0, 0.0))
+    return 0.5 + (d @ r) / (z_safe * t) + sx, 0.5 - (d @ u_axis) / (z_safe * t) + sy, z
+
+
+def _mask_from_uv(u, v, grid):
+    m = np.zeros((grid, grid), bool)
+    ok = (u >= 0) & (u < 1) & (v >= 0) & (v < 1)
+    m[(v[ok] * grid).astype(int), (u[ok] * grid).astype(int)] = True
+    return _dilate(m, 1)
+
+
+def _dilate(mask, r):
+    out = mask.copy()
+    for dy in range(-r, r + 1):
+        for dx in range(-r, r + 1):
+            shifted = np.zeros_like(mask)
+            ys = slice(max(dy, 0), mask.shape[0] + min(dy, 0))
+            yd = slice(max(-dy, 0), mask.shape[0] + min(-dy, 0))
+            xs = slice(max(dx, 0), mask.shape[1] + min(dx, 0))
+            xd = slice(max(-dx, 0), mask.shape[1] + min(-dx, 0))
+            shifted[yd, xd] = mask[ys, xs]
+            out |= shifted
+    return out
+
+
+def _erode(mask, r):
+    return ~_dilate(~mask, r)
+
+
+def load_reference(path):
+    """RGBA float array, row 0 = top of the image."""
+    img = bpy.data.images.load(str(Path(path).resolve()))
+    img.colorspace_settings.name = "Non-Color"  # keep stored (sRGB) values untouched
+    arr = image_to_array(img)[::-1].copy()
+    bpy.data.images.remove(img)
+    return arr
+
+
+def _resample_mask(alpha, grid):
+    h, w = alpha.shape
+    ys = ((np.arange(grid) + 0.5) / grid * h).astype(int)
+    xs = ((np.arange(grid) + 0.5) / grid * w).astype(int)
+    return alpha[ys][:, xs] > 0.5
+
+
+def _orbit(cam, d_az, d_el, d_scale):
+    pos, r, u, f = _cam_basis(cam)
+    target = np.asarray(cam["target"], float)
+    offset = pos - target
+    up = np.asarray(cam["up"], float)
+    rot = (mathutils.Matrix.Rotation(math.radians(d_az), 3, mathutils.Vector(up)) @
+           mathutils.Matrix.Rotation(math.radians(d_el), 3, mathutils.Vector(r)))
+    new = dict(cam)
+    new["position"] = (target + np.array(rot) @ offset * d_scale).tolist()
+    return new
+
+
+def calibrate_camera(pts, ref_alpha, prior, grid=96, search_deg=15.0):
+    """Refine the input camera so the projected scan silhouette matches the image alpha.
+
+    Searches azimuth/elevation/distance around ``prior`` and solves the 2D
+    principal shift by centroid alignment. Returns (camera, IoU).
+    """
+    ref = _resample_mask(ref_alpha, grid)
+    if ref.sum() == 0:
+        return prior, 0.0
+    ref_c = np.argwhere(ref).mean(axis=0)[::-1] / grid  # (u, v)
+
+    def score(cam):
+        cam = dict(cam, shift=(0.0, 0.0))
+        u, v, z = project_to_image(pts, cam)
+        front = z > 0
+        if front.sum() < 10:
+            return 0.0, cam
+        shift = np.clip(ref_c - np.array([u[front].mean(), v[front].mean()]), -0.15, 0.15)
+        cam["shift"] = shift.tolist()
+        m = _mask_from_uv(u[front] + shift[0], v[front] + shift[1], grid)
+        inter, union = (m & ref).sum(), (m | ref).sum()
+        return (inter / union if union else 0.0), cam
+
+    best_iou, best = score(prior)
+    for step, span in ((5.0, search_deg), (2.0, 4.0), (1.0, 1.0)):
+        center = best
+        for d_az in np.arange(-span, span + 1e-9, step):
+            for d_el in np.arange(-span, span + 1e-9, step):
+                for d_s in (0.92, 0.96, 1.0, 1.04, 1.08):
+                    iou, cam = score(_orbit(center, d_az, d_el, d_s))
+                    if iou > best_iou:
+                        best_iou, best = iou, cam
+    return best, float(best_iou)
+
+
+def _bake_float(objs, name, res, node_output, bake_all):
+    """Bake a Geometry-node output (Position / Normal) into a float image via emission."""
+    img = bpy.data.images.new(name, width=res, height=res, alpha=False, float_buffer=True)
+    img.colorspace_settings.name = "Non-Color"
+    mat, nt, emit = emission_material(f"bake_{name}")
+    geo = nt.nodes.new("ShaderNodeNewGeometry")
+    nt.links.new(geo.outputs[node_output], emit.inputs["Color"])
+    assign_material(objs, mat)
+    bake_all(img, "EMIT")
+    arr = image_to_array(img)[..., :3].copy()
+    bpy.data.images.remove(img)
+    return arr
+
+
+def _bilinear(img, u, v):
+    """Sample an (H, W, C) top-down image at normalised (u, v)."""
+    h, w = img.shape[:2]
+    x = np.clip(u * w - 0.5, 0, w - 1.001)
+    y = np.clip(v * h - 0.5, 0, h - 1.001)
+    x0, y0 = x.astype(int), y.astype(int)
+    fx, fy = (x - x0)[:, None], (y - y0)[:, None]
+    a, b = img[y0, x0], img[y0, x0 + 1]
+    c, d = img[y0 + 1, x0], img[y0 + 1, x0 + 1]
+    return (a * (1 - fx) + b * fx) * (1 - fy) + (c * (1 - fx) + d * fx) * fy
+
+
+def _project_pass(P, N, candidates, cam, ref, bvh, mirror_axis=None, min_facing=0.15, full_facing=0.55):
+    """One projection pass over ``candidates`` (bool mask). Returns (rows, cols, weights, rgb).
+
+    With ``mirror_axis`` each texel samples the image at its mirror position across that
+    plane through the origin (the asset is centred on X/Y), filling faces the camera never saw
+    on symmetric assets.
+    """
+    pos = np.asarray(cam["position"], float)
+    idx = np.argwhere(candidates)
+    if not len(idx):
+        return idx[:, 0], idx[:, 1], np.zeros(0), np.zeros((0, 3))
+    pts = P[idx[:, 0], idx[:, 1]].copy()
+    nrm = N[idx[:, 0], idx[:, 1]].copy()
+    if mirror_axis is not None:
+        a = "XYZ".index(mirror_axis)
+        pts[:, a] *= -1.0
+        nrm[:, a] *= -1.0
+    nrm /= np.maximum(np.linalg.norm(nrm, axis=1), 1e-9)[:, None]
+    to_cam = pos - pts
+    dist = np.linalg.norm(to_cam, axis=1)
+    dirs = to_cam / np.maximum(dist, 1e-9)[:, None]
+    facing = (nrm * dirs).sum(axis=1)
+    u, v, z = project_to_image(pts, cam)
+    ok = (facing > min_facing) & (u > 0) & (u < 1) & (v > 0) & (v < 1) & (z > 0)
+    sample = np.zeros((len(idx), 4))
+    sample[ok] = _bilinear(ref, u[ok], v[ok])
+    ok &= sample[:, 3] > 0.5
+    # Occlusion: nothing may lie between the (mirrored) texel and the camera
+    eps = 1e-3 * float(np.linalg.norm(np.ptp(pts, axis=0)) + 1e-9)
+    for i in np.flatnonzero(ok):
+        origin = mathutils.Vector(pts[i] + nrm[i] * eps)
+        if bvh.ray_cast(origin, mathutils.Vector(dirs[i]), float(dist[i]) - 2 * eps)[0] is not None:
+            ok[i] = False
+    w = np.clip((facing - min_facing) / (full_facing - min_facing), 0.0, 1.0) * np.clip((sample[:, 3] - 0.5) * 2, 0, 1)
+    w = np.where(ok, w * w * (3 - 2 * w), 0.0)  # smoothstep into the baked colours at grazing angles
+    keep = w > 0
+    return idx[keep, 0], idx[keep, 1], w[keep], sample[keep, :3]
+
+
+def project_reference(objs, albedo, ref, cam, res, bake_all, mirror_axes=()):
+    """Overwrite albedo texels the camera sees (then mirrored fills) with the reference colours."""
+    P = _bake_float(objs, "position", res, "Position", bake_all)
+    N = _bake_float(objs, "normal", res, "Normal", bake_all)
+    covered = np.linalg.norm(N, axis=-1) > 0.5
+    bvh = _bvh(objs)
+    base = image_to_array(albedo)  # baked maps and the albedo share Blender's bottom-up row order
+    weight = np.zeros((res, res))
+    passes = {}
+    for axis in (None, *mirror_axes):
+        todo = covered & (weight < 0.5)
+        rows, cols, w, rgb = _project_pass(P, N, todo, cam, ref, bvh, axis)
+        if axis is not None:
+            w = w * 0.85  # mirrored detail is a guess; let a little of the baked colour through
+        base[rows, cols, :3] = base[rows, cols, :3] * (1 - w[:, None]) + rgb * w[:, None]
+        weight[rows, cols] = np.maximum(weight[rows, cols], w)
+        passes["direct" if axis is None else f"mirror_{axis}"] = int((w > 0.5).sum())
+    array_to_image(albedo, base)
+    reliable = weight > 0.5
+    return {"passes": passes, "covered_texels": int(covered.sum()),
+            "projected_fraction": round(float(reliable.sum()) / max(1, int(covered.sum())), 3),
+            "_reliable": reliable}
+
+
+def resolve_camera(p, scene):
+    """Prior input camera in final asset coordinates (None when the backend gave none)."""
+    cam = p.get("reference_camera")
+    if not cam:
+        return None
+    pos, target, up = (np.asarray(cam[k], float) for k in ("position", "target", "up"))
+    if cam.get("coords") == "gltf":
+        conv = np.array(GLTF_TO_BLENDER)
+        pos, target, up = conv @ pos, conv @ target, conv @ up
+    frame = np.array(scene.get("frame_matrix", np.eye(4).ravel().tolist()), float).reshape(4, 4)
+    to_final = lambda x: (frame @ np.append(x, 1.0))[:3]  # noqa: E731
+    up_final = frame[:3, :3] @ up
+    return {"position": to_final(pos).tolist(), "target": to_final(target).tolist(),
+            "up": (up_final / np.linalg.norm(up_final)).tolist(), "fov_deg": float(cam["fov_deg"])}
 
 
 def op_texture(p: dict) -> dict:
@@ -1443,6 +1961,33 @@ def op_texture(p: dict) -> dict:
         array_to_image(albedo, np.tile(np.array(col + [1.0], dtype=np.float32), (res, res, 1)))
         report["albedo"] = "procedural"
 
+    # --- Sharp detail: re-project the reference image the 3D model was reconstructed from
+    ref_path = p.get("reference_image")
+    reliable = None
+    if p.get("project_reference", True) and ref_path and Path(ref_path).is_file():
+        prior = resolve_camera(p, scene)
+        if prior is None:
+            report["projection"] = {"skipped": "reconstruction backend reports no input camera"}
+        else:
+            ref = load_reference(ref_path)
+            scan = high if high is not None else obj
+            pts = np.vstack([sample_surface(scan, 20000, np.random.default_rng(0))])
+            cam, iou = calibrate_camera(pts, ref[..., 3], prior)
+            proj = {"silhouette_iou": round(iou, 3), "camera": cam}
+            if iou >= float(p.get("min_projection_iou", 0.7)):
+                t0 = time.time()
+                proj.update(project_reference(objs, albedo, ref, cam, res,
+                                              lambda img, t: bake_all(img, t, from_high=False),
+                                              mirror_axes=tuple(p.get("mirror_axes") or ())))
+                proj["seconds"] = round(time.time() - t0, 1)
+                mask = proj.pop("_reliable", None)
+                if mask is not None and proj["projected_fraction"] >= 0.15:
+                    reliable = mask
+            else:
+                proj["skipped"] = "silhouette does not match the reference image"
+            report["projection"] = proj
+            log(f"projection: IoU {iou:.3f}, {proj.get('projected_fraction', 0)} of texels")
+
     # --- Normal (high -> low detail transfer). Off for primitive templates by default:
     # it would re-introduce the scan's lumpiness as shading.
     if high is not None and p.get("bake_normal", True):
@@ -1454,7 +1999,7 @@ def op_texture(p: dict) -> dict:
         report["normal"] = "none"
 
     # --- Roughness / Metallic
-    report["material_coverage"] = derive_pbr(albedo, rough, metal, materials, material_ids)
+    report["material_coverage"] = derive_pbr(albedo, rough, metal, materials, material_ids, reliable)
 
     for img, suffix in ((albedo, "albedo"), (normal, "normal"), (rough, "roughness"), (metal, "metallic")):
         if img is not None:
@@ -1478,6 +2023,22 @@ def op_texture(p: dict) -> dict:
 # =============================================================================
 # Stage 5a - segmentation of mechanical parts
 # =============================================================================
+
+def close_small_holes(obj, max_sides: int = 16) -> int:
+    bm = bmesh.new()
+    bm.from_mesh(obj.data)
+    boundary = [e for e in bm.edges if e.is_boundary]
+    filled = 0
+    if boundary:
+        res = bmesh.ops.holes_fill(bm, edges=boundary, sides=max_sides)
+        filled = len(res["faces"])
+        if res["faces"]:
+            bmesh.ops.triangulate(bm, faces=res["faces"])
+        bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+        bm.to_mesh(obj.data)
+    bm.free()
+    return filled
+
 
 def region_box(name, rmin, rmax):
     """Axis-aligned cutter box spanning [rmin, rmax] (world space)."""
@@ -1619,6 +2180,8 @@ def op_segment(p: dict) -> dict:
                 box = region_box("cut_box", rmin - clearance, rmax + clearance)
             boolean(body, box, "DIFFERENCE")
             bpy.data.objects.remove(box, do_unlink=True)
+            for o in (body, new):  # exact booleans on n-gon meshes can leave slivers open
+                close_small_holes(o)
             if face_count(body) < 0.2 * faces_before:
                 log(f"segment: warning - cutting {part['name']} removed most of the body")
         new.name = f"{body.name}_{part['name']}"
@@ -1683,6 +2246,28 @@ def _biped_bones(lo, hi):
     return bones
 
 
+def _quadruped_leg_columns(co, lo, hi, head_dir):
+    """k-means the points under the belly into four leg columns -> {(front|back, L|R): (x, y)}."""
+    H = float(hi[2] - lo[2])
+    cx, cy = float((lo[0] + hi[0]) / 2), float((lo[1] + hi[1]) / 2)
+    under = co[co[:, 2] < lo[2] + 0.35 * H][:, :2]
+    if len(under) < 80:
+        return {}
+    keys = [(leg, side) for leg in ("front", "back") for side in ("L", "R")]
+    span = np.array([hi[0] - lo[0], hi[1] - lo[1]]) * 0.25
+    centers = np.array([[cx + (1 if leg == "front" else -1) * head_dir * span[0],
+                         cy + (1 if side == "L" else -1) * head_dir * span[1]] for leg, side in keys])
+    for _ in range(15):
+        assign = np.argmin(((under[:, None, :] - centers[None]) ** 2).sum(-1), axis=1)
+        for k in range(4):
+            if (assign == k).sum() > 0:
+                centers[k] = under[assign == k].mean(axis=0)
+    counts = np.bincount(assign, minlength=4)
+    if counts.min() < 0.05 * len(under):
+        return {}
+    return {key: (float(c[0]), float(c[1])) for key, c in zip(keys, centers)}
+
+
 def _quadruped_bones(lo, hi, obj):
     """Spine along X, head at the end whose silhouette is taller."""
     L = float(hi[0] - lo[0])
@@ -1705,13 +2290,15 @@ def _quadruped_bones(lo, hi, obj):
         "head": ((x(0.40), 0, z0 + 0.85 * H), (x(0.50), 0, z0 + 0.80 * H), "neck"),
         "tail": ((x(-0.30), 0, body_z), (x(-0.50), 0, body_z - 0.1 * H), "hips"),
     }
+    legs = _quadruped_leg_columns(co, lo, hi, head_dir)
     for side, s in (("L", 1), ("R", -1)):
-        y = s * Wd * 0.3
         for leg, fx, parent in (("front", 0.22, "chest"), ("back", -0.25, "hips")):
-            top = (x(fx), y, body_z - 0.05 * H)
-            mid = (x(fx), y, z0 + 0.35 * H)
-            bot = (x(fx), y, z0 + 0.05 * H)
-            toe = (x(fx + 0.04), y, z0)
+            # .L is the animal's left: +Y when it faces +X
+            lx, y = legs.get((leg, side), (x(fx), s * head_dir * Wd * 0.3))
+            top = (lx, y, body_z - 0.05 * H)
+            mid = (lx, y, z0 + 0.35 * H)
+            bot = (lx, y, z0 + 0.05 * H)
+            toe = (lx + head_dir * 0.04 * L, y, z0)
             bones[f"{leg}_upper.{side}"] = (top, mid, parent)
             bones[f"{leg}_lower.{side}"] = (mid, bot, f"{leg}_upper.{side}")
             bones[f"{leg}_foot.{side}"] = (bot, toe, f"{leg}_lower.{side}")
@@ -1738,7 +2325,292 @@ def build_armature(name, bones):
     return arm
 
 
-def rigify_armature(rig_type, lo, hi):
+# ----------------------------------------------------------------- landmark detection
+
+def _x_clusters(pts, gap):
+    """Split a horizontal slice into runs along X separated by gaps wider than ``gap``."""
+    if not len(pts):
+        return []
+    order = np.argsort(pts[:, 0])
+    xs = pts[order, 0]
+    cuts = np.flatnonzero(np.diff(xs) > gap) + 1
+    return [pts[order[a:b]] for a, b in zip(np.r_[0, cuts], np.r_[cuts, len(xs)])]
+
+
+def _centroid_near(pts, center, axis_dir, half_width, radius, min_points=12):
+    """Centroid of the limb cross-section around ``center`` (slab perpendicular to axis_dir)."""
+    d = pts - center
+    along = d @ axis_dir
+    radial = np.linalg.norm(d - np.outer(along, axis_dir), axis=1)
+    sel = (np.abs(along) < half_width) & (radial < radius)
+    if sel.sum() < min_points:
+        return center, False
+    c = pts[sel].mean(axis=0)
+    # keep the joint on the limb axis line through the slab
+    return center + (c - center) - ((c - center) @ axis_dir) * axis_dir, True
+
+
+def _connected_to(pts, seed, cell):
+    """Points in the voxel-connected (26-neighbour) component nearest to ``seed``."""
+    if not len(pts):
+        return pts
+    keys = np.floor(pts / cell).astype(np.int64)
+    occupied = {}
+    for i, k in enumerate(map(tuple, keys)):
+        occupied.setdefault(k, []).append(i)
+    start = tuple(keys[int(np.argmin(np.linalg.norm(pts - seed, axis=1)))])
+    seen, stack = {start}, [start]
+    while stack:
+        x, y, z = stack.pop()
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for dz in (-1, 0, 1):
+                    n = (x + dx, y + dy, z + dz)
+                    if n in occupied and n not in seen:
+                        seen.add(n)
+                        stack.append(n)
+    return pts[[i for k in seen for i in occupied[k]]]
+
+
+def detect_biped_landmarks(obj):
+    """Joint positions for an upright biped facing -Y, from horizontal cross-sections.
+
+    Finds the crotch (legs split), armpits (arms separate in A-pose) or a T-pose
+    (very wide slices), the neck (narrowest slice above the shoulders), then
+    places elbows, wrists and knees at limb cross-section centroids so bones
+    run through the middle of the limbs. Anything not found falls back to
+    standard human proportions and is listed under ``fallback``.
+    """
+    rng = np.random.default_rng(0)
+    pts = np.vstack([world_coords(obj), sample_surface(obj, 60000, rng)])
+    lo, hi = pts.min(axis=0), pts.max(axis=0)
+    H = float(hi[2] - lo[2])
+    z0 = float(lo[2])
+    cx = 0.0
+    detected, fallback = [], []
+    nb = 120
+    edges = np.linspace(z0, z0 + H, nb + 1)
+    bins = [pts[(pts[:, 2] >= edges[i]) & (pts[:, 2] < edges[i + 1])] for i in range(nb)]
+    zc = (edges[:-1] + edges[1:]) / 2
+    frac = (zc - z0) / H
+
+    def split_at_center(sl):
+        return len(sl) > 20 and not np.any(np.abs(sl[:, 0] - cx) < 0.012 * H) and \
+            np.any(sl[:, 0] < cx) and np.any(sl[:, 0] > cx)
+
+    # Crotch: top of the run of slices where the legs are separated
+    crotch = None
+    run = False
+    for i in range(nb):
+        if frac[i] < 0.08:
+            continue
+        if frac[i] > 0.68:
+            break
+        if split_at_center(bins[i]):
+            run, crotch = True, zc[i]
+        elif run:
+            break
+    if crotch is None:
+        crotch = z0 + 0.47 * H
+        fallback.append("crotch")
+    else:
+        detected.append("crotch")
+
+    def torso_cluster(sl):
+        cl = _x_clusters(sl, 0.02 * H)
+        return min(cl, key=lambda c: abs(np.median(c[:, 0]) - cx)) if cl else None
+
+    hip_sl = [torso_cluster(bins[i]) for i in range(nb) if crotch + 0.04 * H < zc[i] < crotch + 0.14 * H]
+    hip_half = np.median([np.ptp(c[:, 0]) / 2 for c in hip_sl if c is not None]) if hip_sl else 0.1 * H
+
+    # Arms: A-pose -> separate clusters beside the torso; T-pose -> very wide slices
+    armpit, pose, t_heights = None, "fallback", []
+    for i in range(nb):
+        if not (crotch + 0.05 * H < zc[i] < z0 + 0.9 * H):
+            continue
+        cl = _x_clusters(bins[i], 0.02 * H)
+        if len(cl) >= 3:
+            meds = [np.median(c[:, 0]) for c in cl]
+            if min(meds) < cx - hip_half and max(meds) > cx + hip_half:
+                armpit, pose = zc[i], "A"
+        if len(bins[i]) and np.ptp(bins[i][:, 0]) > 4.0 * hip_half:
+            t_heights.append(zc[i])
+    # T-pose arms make the body widest at shoulder height; A-pose arms are widest at the hands
+    # (around half height). Decide on that, not on cluster splits, which depend on mesh density.
+    high = [z for z in t_heights if z > z0 + 0.68 * H]
+    if high and np.median(t_heights) > z0 + 0.68 * H:
+        pose, armpit = "T", float(np.min(high))
+    if armpit is None:
+        armpit = z0 + 0.75 * H
+        fallback.append("armpit")
+    else:
+        detected.append(f"armpit({pose}-pose)")
+
+    # Neck: narrowest torso slice between the shoulders and the crown
+    neck, best_w = None, None
+    for i in range(nb):
+        if armpit + 0.04 * H < zc[i] < z0 + 0.9 * H:
+            c = torso_cluster(bins[i])
+            if c is not None and len(c) > 10:
+                w = np.ptp(c[:, 0])
+                if best_w is None or w < best_w:
+                    neck, best_w = zc[i], w
+    if neck is None:
+        neck = z0 + 0.85 * H
+        fallback.append("neck")
+    else:
+        detected.append("neck")
+
+    def slice_centroid(z, half=0.015 * H, side=0):
+        sel = np.abs(pts[:, 2] - z) < half
+        if side:
+            sel &= side * (pts[:, 0] - cx) > 0
+        sub = pts[sel]
+        if side == 0 and len(sub):
+            c = torso_cluster(sub)
+            sub = c if c is not None else sub
+        return sub.mean(axis=0) if len(sub) > 5 else np.array([cx, (lo[1] + hi[1]) / 2, z])
+
+    L = {"pose": pose}
+    hips_c = slice_centroid(crotch + 0.07 * H)
+    chest_c = slice_centroid(armpit - 0.02 * H)
+    neck_c = slice_centroid(neck)
+    # Anatomy: the hip joints sit ~5% of height ABOVE the crotch, the pelvis root a little higher
+    L["hips"] = np.array([cx, hips_c[1], crotch + 0.07 * H])
+    L["spine1"] = np.array([cx, *slice_centroid(crotch + 0.07 * H + (armpit - crotch) * 0.3)[1:2],
+                            crotch + 0.07 * H + (armpit - crotch) * 0.3])
+    L["spine2"] = np.array([cx, chest_c[1], armpit - 0.02 * H])
+    L["neck_base"] = np.array([cx, neck_c[1], neck - 0.03 * H])
+    L["head_base"] = np.array([cx, neck_c[1], neck + 0.02 * H])
+    L["head_top"] = np.array([cx, neck_c[1], float(hi[2])])
+
+    chest_sl = torso_cluster(pts[np.abs(pts[:, 2] - (armpit - 0.03 * H)) < 0.015 * H])
+    torso_half = float(np.ptp(chest_sl[:, 0]) / 2) if chest_sl is not None and len(chest_sl) > 5 else 0.12 * H
+    if pose == "T":
+        torso_half = min(torso_half, 1.6 * hip_half)
+    for side, s in (("L", 1), ("R", -1)):
+        shoulder_z = armpit + (0.0 if pose == "T" else 0.04 * H)
+        sj = np.array([cx + s * 0.85 * torso_half, chest_c[1], shoulder_z])
+        L[f"clavicle.{side}"] = np.array([cx + s * 0.02 * H, chest_c[1], shoulder_z])
+        L[f"shoulder.{side}"] = sj
+        outboard = pts[(s * (pts[:, 0] - cx) > torso_half * 1.05) & (pts[:, 2] < neck)]
+        # Only the region connected to the shoulder is arm (outer thighs are outboard too)
+        arm = _connected_to(outboard, sj, 0.02 * H)
+        if len(arm) > 50 and pose != "fallback":
+            tip = arm[np.argmax(np.linalg.norm(arm - sj, axis=1))]
+            axis = tip - sj
+            length = float(np.linalg.norm(axis))
+            axis /= max(length, 1e-9)
+            elbow, ok_e = _centroid_near(arm, sj + 0.42 * length * axis, axis, 0.03 * H, 0.12 * H)
+            wrist, ok_w = _centroid_near(arm, sj + 0.75 * length * axis, axis, 0.03 * H, 0.10 * H)
+            L[f"elbow.{side}"], L[f"wrist.{side}"], L[f"hand_tip.{side}"] = elbow, wrist, tip
+            detected.append(f"arm.{side}" + ("" if ok_e and ok_w else "(axis only)"))
+        else:
+            reach = 0.40 * H
+            down = np.array([s * 0.5, 0.0, -0.866])  # 60 degrees below horizontal
+            L[f"elbow.{side}"] = sj + down * reach * 0.42
+            L[f"wrist.{side}"] = sj + down * reach * 0.75
+            L[f"hand_tip.{side}"] = sj + down * reach
+            fallback.append(f"arm.{side}")
+        leg = pts[(s * (pts[:, 0] - cx) > 0) & (pts[:, 2] < crotch)]
+        if len(leg) > 50:
+            top = leg[leg[:, 2] > crotch - 0.08 * H]
+            hip_x = float(np.median(top[:, 0])) if len(top) > 5 else cx + s * 0.09 * H
+            hip = np.array([hip_x, hips_c[1], crotch + 0.05 * H])
+            low = leg[(leg[:, 2] > z0 + 0.06 * H) & (leg[:, 2] < z0 + 0.10 * H)]
+            ank_xy = low.mean(axis=0)[:2] if len(low) > 5 else np.array([hip_x, hips_c[1]])
+            ankle = np.array([ank_xy[0], ank_xy[1], z0 + 0.05 * H])
+            knee_z = (hip[2] + ankle[2]) / 2
+            ks = leg[np.abs(leg[:, 2] - knee_z) < 0.02 * H]
+            kxy = ks.mean(axis=0)[:2] if len(ks) > 5 else (hip[:2] + ankle[:2]) / 2
+            knee = np.array([kxy[0], kxy[1] - 0.01 * H, knee_z])  # slight forward bend for IK
+            foot = leg[leg[:, 2] < z0 + 0.04 * H]
+            toe_y = float(foot[:, 1].min()) if len(foot) > 5 else ankle[1] - 0.08 * H
+            L[f"hip.{side}"], L[f"knee.{side}"], L[f"ankle.{side}"] = hip, knee, ankle
+            L[f"ball.{side}"] = np.array([ankle[0], ankle[1] + 0.7 * (toe_y - ankle[1]), z0 + 0.02 * H])
+            L[f"toe.{side}"] = np.array([ankle[0], toe_y, z0 + 0.02 * H])
+            detected.append(f"leg.{side}")
+        else:
+            hx = cx + s * 0.09 * H
+            L[f"hip.{side}"] = np.array([hx, hips_c[1], crotch + 0.05 * H])
+            L[f"knee.{side}"] = np.array([hx, hips_c[1] - 0.01 * H, z0 + 0.28 * H])
+            L[f"ankle.{side}"] = np.array([hx, hips_c[1], z0 + 0.05 * H])
+            L[f"ball.{side}"] = np.array([hx, hips_c[1] - 0.06 * H, z0 + 0.02 * H])
+            L[f"toe.{side}"] = np.array([hx, hips_c[1] - 0.09 * H, z0 + 0.02 * H])
+            fallback.append(f"leg.{side}")
+    L["detected"], L["fallback"], L["height"] = detected, fallback, H
+    return L
+
+
+def _biped_bones_from_landmarks(L):
+    b = {
+        "hips": (L["hips"], L["spine1"], None),
+        "spine": (L["spine1"], L["spine2"], "hips"),
+        "chest": (L["spine2"], L["neck_base"], "spine"),
+        "neck": (L["neck_base"], L["head_base"], "chest"),
+        "head": (L["head_base"], L["head_top"], "neck"),
+    }
+    for side in ("L", "R"):
+        b[f"shoulder.{side}"] = (L[f"clavicle.{side}"], L[f"shoulder.{side}"], "chest")
+        b[f"upper_arm.{side}"] = (L[f"shoulder.{side}"], L[f"elbow.{side}"], f"shoulder.{side}")
+        b[f"forearm.{side}"] = (L[f"elbow.{side}"], L[f"wrist.{side}"], f"upper_arm.{side}")
+        b[f"hand.{side}"] = (L[f"wrist.{side}"], L[f"hand_tip.{side}"], f"forearm.{side}")
+        b[f"thigh.{side}"] = (L[f"hip.{side}"], L[f"knee.{side}"], "hips")
+        b[f"shin.{side}"] = (L[f"knee.{side}"], L[f"ankle.{side}"], f"thigh.{side}")
+        b[f"foot.{side}"] = (L[f"ankle.{side}"], L[f"ball.{side}"], f"shin.{side}")
+        b[f"toe.{side}"] = (L[f"ball.{side}"], L[f"toe.{side}"], f"foot.{side}")
+    return {k: (tuple(map(float, h)), tuple(map(float, t)), par) for k, (h, t, par) in b.items()}
+
+
+def fit_metarig(metarig, L):
+    """Move Rigify basic-human metarig joints onto the detected landmarks."""
+    H = L["height"]
+    lerp = lambda a, b, t: a + (b - a) * t  # noqa: E731
+    target = {
+        "spine": (L["hips"], lerp(L["hips"], L["neck_base"], 0.25)),
+        "spine.001": (lerp(L["hips"], L["neck_base"], 0.25), lerp(L["hips"], L["neck_base"], 0.45)),
+        "spine.002": (lerp(L["hips"], L["neck_base"], 0.45), lerp(L["hips"], L["neck_base"], 0.7)),
+        "spine.003": (lerp(L["hips"], L["neck_base"], 0.7), L["neck_base"]),
+        "spine.004": (L["neck_base"], lerp(L["neck_base"], L["head_base"], 0.5)),
+        "spine.005": (lerp(L["neck_base"], L["head_base"], 0.5), L["head_base"]),
+        "spine.006": (L["head_base"], L["head_top"]),
+    }
+    for side, s in (("L", 1), ("R", -1)):
+        sj = L[f"shoulder.{side}"]
+        target.update({
+            f"shoulder.{side}": (L[f"clavicle.{side}"] + np.array([0, -0.03 * H, 0]), lerp(L[f"clavicle.{side}"], sj, 0.9)),
+            f"upper_arm.{side}": (sj, L[f"elbow.{side}"]),
+            f"forearm.{side}": (L[f"elbow.{side}"], L[f"wrist.{side}"]),
+            f"hand.{side}": (L[f"wrist.{side}"], L[f"hand_tip.{side}"]),
+            f"breast.{side}": (np.array([s * 0.065 * H, L["spine2"][1], L["spine2"][2] - 0.05 * H]),
+                               np.array([s * 0.065 * H, L["spine2"][1] - 0.07 * H, L["spine2"][2] - 0.05 * H])),
+            f"pelvis.{side}": (L["hips"], L[f"hip.{side}"] + np.array([0, -0.05 * H, 0.08 * H])),
+            f"thigh.{side}": (L[f"hip.{side}"], L[f"knee.{side}"]),
+            f"shin.{side}": (L[f"knee.{side}"], L[f"ankle.{side}"]),
+            f"foot.{side}": (L[f"ankle.{side}"], L[f"ball.{side}"]),
+            f"toe.{side}": (L[f"ball.{side}"], L[f"toe.{side}"]),
+            f"heel.02.{side}": (np.array([L[f"ankle.{side}"][0] - s * 0.02 * H, L[f"ankle.{side}"][1] + 0.025 * H, 0.0]),
+                                np.array([L[f"ankle.{side}"][0] + s * 0.02 * H, L[f"ankle.{side}"][1] + 0.025 * H, 0.0])),
+        })
+    select_only(metarig)
+    set_mode("EDIT")
+    eb = metarig.data.edit_bones
+    moved = 0
+    for name, (head, tail) in target.items():
+        bone = eb.get(name)
+        if bone is None:
+            continue
+        connected = bone.use_connect
+        bone.use_connect = False
+        bone.head, bone.tail = mathutils.Vector(head), mathutils.Vector(tail)
+        bone.use_connect = connected and bone.parent is not None and \
+            (bone.parent.tail - bone.head).length < 1e-4
+        moved += 1
+    set_mode("OBJECT")
+    return moved
+
+
+def rigify_armature(rig_type, lo, hi, landmarks=None):
     import addon_utils
 
     addon_utils.enable("rigify", default_set=True)
@@ -1746,20 +2618,24 @@ def rigify_armature(rig_type, lo, hi):
     if rig_type == "quadruped":
         op = getattr(bpy.ops.object, "armature_wolf_metarig_add", None) or bpy.ops.object.armature_basic_quadruped_metarig_add
     else:
-        op = bpy.ops.object.armature_human_metarig_add
+        # Basic human: body chain without face/finger bones an AI mesh cannot support
+        op = getattr(bpy.ops.object, "armature_basic_human_metarig_add", None) or bpy.ops.object.armature_human_metarig_add
     op()
     metarig = [o for o in bpy.data.objects if o not in before][0]
-    m_lo, m_hi = np.array([1e9] * 3), np.array([-1e9] * 3)
-    for b in metarig.data.bones:
-        for pt in (b.head_local, b.tail_local):
-            m_lo, m_hi = np.minimum(m_lo, pt), np.maximum(m_hi, pt)
-    axis = 2 if rig_type == "biped" else 0
-    factor = float((hi[axis] - lo[axis]) / max(m_hi[axis] - m_lo[axis], 1e-6))
-    metarig.scale = (factor,) * 3
-    metarig.location = ((lo[0] + hi[0]) / 2 - (m_lo[0] + m_hi[0]) / 2 * factor,
-                        (lo[1] + hi[1]) / 2 - (m_lo[1] + m_hi[1]) / 2 * factor,
-                        lo[2] - m_lo[2] * factor)
-    apply_transforms(metarig)
+    if landmarks is not None and rig_type == "biped":
+        fit_metarig(metarig, landmarks)
+    else:
+        m_lo, m_hi = np.array([1e9] * 3), np.array([-1e9] * 3)
+        for b in metarig.data.bones:
+            for pt in (b.head_local, b.tail_local):
+                m_lo, m_hi = np.minimum(m_lo, pt), np.maximum(m_hi, pt)
+        axis = 2 if rig_type == "biped" else 0
+        factor = float((hi[axis] - lo[axis]) / max(m_hi[axis] - m_lo[axis], 1e-6))
+        metarig.scale = (factor,) * 3
+        metarig.location = ((lo[0] + hi[0]) / 2 - (m_lo[0] + m_hi[0]) / 2 * factor,
+                            (lo[1] + hi[1]) / 2 - (m_lo[1] + m_hi[1]) / 2 * factor,
+                            lo[2] - m_lo[2] * factor)
+        apply_transforms(metarig)
     select_only(metarig)
     bpy.ops.pose.rigify_generate()
     rig = bpy.context.view_layer.objects.active
@@ -1769,6 +2645,123 @@ def rigify_armature(rig_type, lo, hi):
     metarig.hide_set(True)
     metarig["asset_role"] = "metarig"
     return rig
+
+
+def smooth_weights(obj, repeat: int = 1, factor: float = 0.5):
+    """Laplacian-smooth every vertex group over mesh edges (the bpy operator needs a UI)."""
+    groups = list(obj.vertex_groups)
+    if not groups or repeat <= 0:
+        return
+    nv = len(obj.data.vertices)
+    w = np.zeros((nv, len(groups)))
+    for v in obj.data.vertices:
+        for g in v.groups:
+            w[v.index, g.group] = g.weight
+    e = np.empty(len(obj.data.edges) * 2, dtype=np.int64)
+    obj.data.edges.foreach_get("vertices", e)
+    e = e.reshape(-1, 2)
+    deg = np.bincount(e.ravel(), minlength=nv).astype(float)[:, None]
+    for _ in range(repeat):
+        acc = np.zeros_like(w)
+        np.add.at(acc, e[:, 0], w[e[:, 1]])
+        np.add.at(acc, e[:, 1], w[e[:, 0]])
+        w = (1 - factor) * w + factor * np.where(deg > 0, acc / np.maximum(deg, 1), w)
+    for j, g in enumerate(groups):
+        nz = np.flatnonzero(w[:, j] > 1e-4)
+        zero = np.flatnonzero(w[:, j] <= 1e-4)
+        if len(zero):
+            g.remove(zero.tolist())
+        for vi in nz:
+            g.add([int(vi)], float(w[vi, j]), "REPLACE")
+
+
+def clean_weights(obj, max_influences: int = 4, smooth_repeat: int = 1) -> dict:
+    """Game-engine skinning rules: <= N influences per vertex, smoothed, normalised to 1."""
+    select_only(obj)
+    done = {}
+    if smooth_repeat > 0:
+        smooth_weights(obj, smooth_repeat)
+        done["smooth"] = smooth_repeat
+    for name, op, kwargs in (
+        ("limit", bpy.ops.object.vertex_group_limit_total, {"group_select_mode": "ALL", "limit": max_influences}),
+        ("normalize", bpy.ops.object.vertex_group_normalize_all, {"group_select_mode": "ALL", "lock_active": False}),
+    ):
+        try:
+            done[name] = "FINISHED" in call_op(op, **kwargs)
+        except RuntimeError as exc:
+            done[name] = f"failed: {exc}"
+    counts = [sum(1 for g in v.groups if g.weight > 1e-4) for v in obj.data.vertices]
+    done["max_influences"] = max(counts) if counts else 0
+    return done
+
+
+def _find_bone(arm, base):
+    for prefix in ("DEF-", ""):
+        b = arm.pose.bones.get(prefix + base)
+        if b is not None:
+            return b
+    return None
+
+
+def pose_test(obj, arm, rig_type) -> dict:
+    """Bend the main joints and measure how badly the skin stretches or collapses.
+
+    Rotations are applied in world space about each joint, so the test works for
+    any skeleton naming/roll; Rigify's constraints are muted so DEF bones can be
+    posed directly.
+    """
+    for pb in arm.pose.bones:
+        for c in pb.constraints:
+            c.mute = True
+    bpy.context.view_layer.update()
+    rest = world_coords(obj)
+    eidx = np.empty(len(obj.data.edges) * 2, dtype=np.int64)
+    obj.data.edges.foreach_get("vertices", eidx)
+    eidx = eidx.reshape(-1, 2)
+    rest_len = np.linalg.norm(rest[eidx[:, 0]] - rest[eidx[:, 1]], axis=1)
+
+    if rig_type == "quadruped":
+        moves = [(f"{leg}_upper.{s}", (0, 1, 0), 25) for leg in ("front", "back") for s in "LR"] + \
+                [(f"{leg}_lower.{s}", (0, 1, 0), -35) for leg in ("front", "back") for s in "LR"] + \
+                [("neck", (0, 1, 0), -20)]
+    else:
+        # Raise the arms (rotating down would drive A-pose arms through the torso)
+        moves = [("upper_arm.L", (0, 1, 0), -35), ("upper_arm.R", (0, 1, 0), 35),
+                 ("forearm.L", None, 60), ("forearm.R", None, 60),
+                 ("thigh.L", (1, 0, 0), -30), ("thigh.R", (1, 0, 0), -30),
+                 ("shin.L", (1, 0, 0), 50), ("shin.R", (1, 0, 0), 50),
+                 ("chest", (0, 0, 1), 20), ("spine.003", (0, 0, 1), 20)]
+    posed = []
+    for base, axis, deg in moves:
+        pb = _find_bone(arm, base)
+        if pb is None:
+            continue
+        head = np.array(pb.head)
+        if axis is None:  # bend forward around the axis perpendicular to the limb and -Y
+            limb = np.array(pb.tail) - head
+            axis = np.cross(limb / max(np.linalg.norm(limb), 1e-9), (0.0, -1.0, 0.0))
+            if np.linalg.norm(axis) < 1e-6:
+                axis = (1.0, 0.0, 0.0)
+        rot = mathutils.Matrix.Rotation(math.radians(deg), 4, mathutils.Vector(axis).normalized())
+        pivot = mathutils.Matrix.Translation(mathutils.Vector(head))
+        pb.matrix = pivot @ rot @ pivot.inverted() @ pb.matrix
+        bpy.context.view_layer.update()
+        posed.append(pb.name)
+    dg = bpy.context.evaluated_depsgraph_get()
+    ev = obj.evaluated_get(dg)
+    me = ev.to_mesh()
+    co = np.empty(len(me.vertices) * 3)
+    me.vertices.foreach_get("co", co)
+    co = co.reshape(-1, 3) @ np.array(obj.matrix_world)[:3, :3].T + np.array(obj.matrix_world)[:3, 3]
+    ev.to_mesh_clear()
+    if len(co) != len(rest):
+        return {"posed_bones": posed, "error": "evaluated mesh topology differs"}
+    ratio = np.linalg.norm(co[eidx[:, 0]] - co[eidx[:, 1]], axis=1) / np.maximum(rest_len, 1e-9)
+    bad = (ratio > 1.6) | (ratio < 0.55)
+    moved = np.linalg.norm(co - rest, axis=1)
+    return {"posed_bones": posed, "bad_edge_fraction": round(float(bad.mean()), 4),
+            "max_stretch": round(float(ratio.max()), 3), "min_stretch": round(float(ratio.min()), 3),
+            "moved_vertex_fraction": round(float((moved > 1e-4 * float(np.ptp(rest[:, 2]))).mean()), 3)}
 
 
 def weight_coverage(obj) -> float:
@@ -1810,10 +2803,16 @@ def op_rig(p: dict) -> dict:
     lo, hi = bbox([obj])
     rig_type = p.get("rig_type", "biped")
     report = {"rig_type": rig_type}
+    landmarks = None
+    if rig_type == "biped":
+        landmarks = detect_biped_landmarks(obj)
+        report["landmarks"] = {"pose": landmarks["pose"], "detected": landmarks["detected"],
+                               "fallback": landmarks["fallback"]}
+        log(f"rig: {landmarks['pose']}-pose, detected {landmarks['detected']}, fallback {landmarks['fallback']}")
     arm = None
     if p.get("method", "rigify") == "rigify":
         try:
-            arm = rigify_armature(rig_type, lo, hi)
+            arm = rigify_armature(rig_type, lo, hi, landmarks)
             report["method"] = "rigify"
         except Exception as exc:  # rigify availability/metarig names vary per version
             log(f"rigify failed ({exc}); falling back to generated skeleton")
@@ -1825,19 +2824,21 @@ def op_rig(p: dict) -> dict:
             bones, head_dir = _quadruped_bones(lo, hi, obj)
             report["head_direction"] = "+X" if head_dir > 0 else "-X"
         else:
-            bones = _biped_bones(lo, hi)
+            bones = _biped_bones_from_landmarks(landmarks)
         arm = build_armature(f"{obj.name}_rig", bones)
         report["method"] = "generated"
     arm["asset_role"] = "armature"
 
-    select_only(obj, arm, active=arm)
-    try:
-        bpy.ops.object.parent_set(type="ARMATURE_AUTO")
-    except RuntimeError as exc:
-        log(f"automatic weights failed: {exc}")
+    weights = p.get("weights", "auto")
+    if weights != "proximity":
+        select_only(obj, arm, active=arm)
+        try:
+            bpy.ops.object.parent_set(type="ARMATURE_AUTO")
+        except RuntimeError as exc:
+            log(f"automatic weights failed: {exc}")
     coverage = weight_coverage(obj)
     report["auto_weight_coverage"] = round(coverage, 3)
-    if coverage < 0.95:
+    if weights == "proximity" or coverage < 0.95:
         # Bone heat fails on non-manifold or self-intersecting meshes
         log(f"bone-heat covered {coverage:.0%} of vertices; using proximity weights")
         if obj.parent is None:
@@ -1847,9 +2848,17 @@ def op_rig(p: dict) -> dict:
         report["weights"] = "proximity"
     else:
         report["weights"] = "bone_heat"
+    report["weight_cleanup"] = clean_weights(obj, int(p.get("max_influences", 4)), int(p.get("weight_smooth", 1)))
     report["deform_bones"] = sum(1 for b in arm.data.bones if b.use_deform)
     report["weight_coverage"] = round(weight_coverage(obj), 3)
-    save_blend(p["output_blend"])
+    save_blend(p["output_blend"])  # rest pose: this is what gets exported
+
+    if p.get("pose_test", True):
+        report["pose_test"] = pose_test(obj, arm, rig_type)
+        posed = str(Path(p["output_blend"]).with_name(Path(p["output_blend"]).stem + "_posed.blend"))
+        save_blend(posed)
+        report["posed_blend"] = posed
+        log(f"rig: pose test {report['pose_test']}")
     return report
 
 

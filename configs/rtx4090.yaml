@@ -1,0 +1,51 @@
+# Tuned for a single RTX 4090 (24 GB). Copy to config.yaml or pass --config configs/rtx4090.yaml.
+# Assumes Ollama serves the LLMs locally; swap llm/vision for API providers if you prefer.
+
+llm:
+  provider: ollama
+  model: qwen2.5:14b-instruct      # ~9 GB; unloaded by Ollama after use with OLLAMA_KEEP_ALIVE=0
+vision:
+  provider: ollama
+  model: qwen2.5vl:7b              # ~6-8 GB
+
+diffusion:
+  backend: diffusers
+  model_id: stabilityai/stable-diffusion-xl-base-1.0
+  steps: 30
+  guidance_scale: 6.0
+  width: 1024
+  height: 1024
+  enable_cpu_offload: false        # 24 GB holds SDXL comfortably
+  # FLUX.1-schnell alternative (sharper, needs ~24 GB bf16 or offload):
+  # model_id: black-forest-labs/FLUX.1-schnell
+  # pipeline_type: flux
+  # steps: 4
+  # guidance_scale: 0.0
+
+preprocess:
+  projection_size: 2048
+
+reconstruction:
+  backend: triposr
+  device: cuda:0
+  mc_resolution: 320               # more detail than the 256 default; ~8 GB
+  chunk_size: 16384
+
+blender:
+  use_gpu: true                    # Cycles OptiX for bakes and audit renders
+
+cleanup:
+  voxel_resolution: 256
+
+texture:
+  resolution: 4096
+  bake_samples: 32
+
+render:
+  resolution: 1024
+  engine: cycles
+  samples: 64
+
+pipeline:
+  max_iterations: 3
+  unload_models_between_stages: true

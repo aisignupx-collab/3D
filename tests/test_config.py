@@ -39,3 +39,10 @@ def test_example_config_matches_schema():
 
     example = Path(__file__).resolve().parents[1] / "config.example.yaml"
     load_config(str(example))
+
+
+def test_rtx4090_profile_matches_schema():
+    from pathlib import Path
+
+    cfg = load_config(str(Path(__file__).resolve().parents[1] / "configs" / "rtx4090.yaml"))
+    assert cfg.texture.resolution == 4096 and cfg.reconstruction.device == "cuda:0"

@@ -43,6 +43,9 @@ class RawMesh:
     vertices: int = 0
     faces: int = 0
     seconds: float = 0.0
+    # Input camera of the reconstruction model in the exported file's coordinates
+    # ({"position", "target", "up", "fov_deg", "coords": "gltf"|"blender"}), if known
+    camera: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return dict(self.__dict__)
@@ -142,7 +145,30 @@ class TripoSRBackend:
         out = out_dir / "raw_triposr.glb"
         mesh.export(out)
         return RawMesh(str(out), "triposr", has_vertex_colors=mesh.visual.kind == "vertex",
-                       vertices=len(mesh.vertices), faces=len(mesh.faces))
+                       vertices=len(mesh.vertices), faces=len(mesh.faces), camera=self.input_camera())
+
+    @staticmethod
+    def input_camera() -> Dict[str, Any]:
+        """TripoSR's canonical input view (camera on +X at 1.9, Z up, 40 deg fovy; see
+        tsr.utils.get_spherical_cameras), re-oriented like the exported mesh."""
+        import numpy as np
+
+        rot = TripoSRBackend._export_rotation()
+        return {"position": (rot @ np.array([1.9, 0.0, 0.0])).tolist(), "target": [0.0, 0.0, 0.0],
+                "up": (rot @ np.array([0.0, 0.0, 1.0])).tolist(), "fov_deg": 40.0, "coords": "gltf"}
+
+    @staticmethod
+    def _export_rotation():
+        import numpy as np
+
+        def rot(axis, angle):
+            c, s = np.cos(angle), np.sin(angle)
+            if axis == "x":
+                return np.array([[1, 0, 0], [0, c, -s], [0, s, c]])
+            return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]])
+
+        # Same as the mesh: rotate -90 about X, then +90 about Y
+        return rot("y", np.pi / 2) @ rot("x", -np.pi / 2)
 
     def unload(self):
         self.model = None

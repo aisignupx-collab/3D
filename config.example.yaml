@@ -2,11 +2,13 @@
 # asset_pipeline/config.py. Env overrides: ASSET_PIPELINE_<SECTION>__<KEY>=value
 
 llm:                         # Stage 1 concept planner (text)
-  provider: ollama           # ollama | openai_compatible (vLLM / LM Studio / llama.cpp) | openai | anthropic
+  # ollama | openai_compatible | lmstudio | vllm | openai | anthropic | deepseek | gemini | openrouter | cli
+  provider: ollama
   model: qwen2.5:14b-instruct
   base_url: http://localhost:11434   # vLLM: http://localhost:8000  LM Studio: http://localhost:1234
-  api_key_env: ""            # e.g. ANTHROPIC_API_KEY / OPENAI_API_KEY for cloud providers
+  api_key_env: ""            # override the provider's default key variable (keys never go in this file)
   temperature: 0.2
+  command: ""                # provider cli: "claude -p {prompt}" | "codex exec {prompt}" | "opencode run {prompt}"
 
 vision:                      # Stage 6 auditor (must accept images)
   provider: ollama
@@ -31,6 +33,7 @@ preprocess:
   rembg_model: isnet-general-use
   foreground_ratio: 0.85
   output_size: 512
+  projection_size: 2048      # high-res copy of the reconstruction input, projected back as texture
 
 reconstruction:              # Stage 2
   backend: triposr           # triposr | instantmesh | openlrm | command | primitive
@@ -60,6 +63,7 @@ cleanup:                     # Stage 3 (the audit loop adjusts these)
   auto_orient: true          # undo camera-frame yaw/tilt (min-volume box search)
   max_tilt_correction: 45.0
   orient_longest_axis: true  # longest horizontal extent -> X
+  symmetrize_characters: true  # mirror characters/creatures across X before remeshing
   import_rotation_deg: [0.0, 0.0, 0.0]
 
 shapes:                      # Stage 3b primitive templates
@@ -69,11 +73,17 @@ shapes:                      # Stage 3b primitive templates
   union: true                # boolean-union components into one watertight shell
   refine: true               # snap component extents to the scan
   bake_normal: false         # bake the scan's (lumpy) normals onto the clean shapes
+  blueprint: true            # guns/tools/machinery: three-view silhouette hull
+  blueprint_max_error: 0.05
+  blueprint_resolution: 256
 
 texture:                     # Stage 4
   resolution: 2048           # 1024 | 2048 | 4096
   uv_method: smart           # smart | seams | lightmap
   albedo_source: bake        # bake (from reconstruction colours) | projection (reference views) | procedural
+  project_reference: true    # re-project the reconstruction's input image onto visible texels
+  min_projection_iou: 0.7
+  mirror_fill: true          # fill unseen faces from the mirrored view (per-category symmetry)
   cage_extrusion: 0.01
   bake_samples: 16
 

@@ -127,3 +127,40 @@ def test_retry_on_bad_json():
 def test_unknown_provider():
     with pytest.raises(ValueError):
         LLMClient("nope", "m")
+
+
+def test_presets_fill_url_and_key(monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "ds-key")
+    client = LLMClient("deepseek", "deepseek-chat", "http://localhost:11434")  # config default URL is replaced
+    assert client._openai_root() == "https://api.deepseek.com/v1" and client.api_key == "ds-key"
+    gemini = LLMClient("gemini", "gemini-2.5-flash")
+    assert gemini._openai_root() == "https://generativelanguage.googleapis.com/v1beta/openai"
+    assert LLMClient("openrouter", "x", "https://my-proxy/v1")._openai_root() == "https://my-proxy/v1"
+
+
+def test_preset_uses_openai_wire_format(image, monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+    srv = _Server({"/v1/chat/completions": {"choices": [{"message": {"content": '{"ok": 2}'}}]}})
+    try:
+        client = LLMClient("openrouter", "deepseek/deepseek-chat", srv.url + "/v1")
+        assert client.chat_json("hi", images=[image]) == {"ok": 2}
+        assert srv.requests[0]["headers"]["Authorization"] == "Bearer or-key"
+    finally:
+        srv.close()
+
+
+def test_cli_provider(tmp_path, image):
+    import sys
+
+    script = tmp_path / "agent.py"
+    script.write_text("import sys, json\ntext = sys.stdin.read()\nprint('thinking...')\n"
+                      "print(json.dumps({'chars': len(text), 'saw_image': 'x.png' in text}))\n")
+    client = LLMClient("cli", "", command=f"{sys.executable} {script}")
+    assert client.ping()
+    reply = client.chat_json("describe", system="be brief", images=[image])
+    assert reply["saw_image"] is True and reply["chars"] > 10
+
+    echo = LLMClient("cli", "", command=f"{sys.executable} -c 'import sys; print(sys.argv[1])' {{prompt}}")
+    assert echo.chat("hello there").strip() == "hello there"
+    with pytest.raises(ValueError):
+        LLMClient("cli", "")

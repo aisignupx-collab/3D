@@ -26,7 +26,7 @@ ENV_PREFIX = "ASSET_PIPELINE_"
 class LLMConfig:
     """Text LLM used for concept planning (Stage 1)."""
 
-    # ollama | openai_compatible (vLLM, LM Studio, llama.cpp server) | openai | anthropic
+    # ollama | openai_compatible | openai | anthropic | deepseek | gemini | openrouter | lmstudio | vllm | cli
     provider: str = "ollama"
     model: str = "qwen2.5:14b-instruct"
     base_url: str = "http://localhost:11434"
@@ -34,6 +34,7 @@ class LLMConfig:
     temperature: float = 0.2
     max_tokens: int = 2048
     timeout_s: int = 300
+    command: str = ""  # provider "cli": e.g. 'claude -p {prompt}', 'codex exec {prompt}', 'opencode run {prompt}'
 
 
 @dataclass
@@ -64,6 +65,7 @@ class PreprocessConfig:
     rembg_model: str = "isnet-general-use"  # u2net | isnet-general-use | birefnet-general
     foreground_ratio: float = 0.85
     output_size: int = 512
+    projection_size: int = 2048  # high-res copy of the reconstruction input for texture projection
     # TripoSR/InstantMesh both expect neutral grey backgrounds
     background_rgb: List[int] = field(default_factory=lambda: [127, 127, 127])
 
@@ -102,6 +104,7 @@ class VisionConfig:
     temperature: float = 0.1
     max_tokens: int = 2048
     timeout_s: int = 300
+    command: str = ""
 
 
 @dataclass
@@ -128,6 +131,7 @@ class CleanupConfig:
     auto_orient: bool = True
     max_tilt_correction: float = 45.0
     orient_longest_axis: bool = True  # then turn the longest horizontal extent onto X
+    symmetrize_characters: bool = True  # mirror characters/creatures across X before remeshing
     # Extra rotation applied on import, for backends with an unusual axis convention
     import_rotation_deg: List[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
 
@@ -143,6 +147,11 @@ class ShapeConfig:
     union: bool = True  # boolean-union components into one watertight shell
     refine: bool = True  # snap component extents to the scan
     bake_normal: bool = False  # bake the scan's normals onto primitives (re-adds lumpiness)
+    # Three-view blueprint (visual hull of side/top/front silhouettes) for hard-surface
+    # assets without a recipe - guns, tools, machinery
+    blueprint: bool = True
+    blueprint_max_error: float = 0.05
+    blueprint_resolution: int = 256  # silhouette cells along the longest axis
 
 
 @dataclass
@@ -159,6 +168,10 @@ class TextureConfig:
     # bake: transfer colours from raw mesh | projection: project reference views
     # | procedural: flat colours from the material spec only
     albedo_source: str = "bake"
+    # Re-project the image the 3D model was built from onto every texel its camera sees
+    project_reference: bool = True
+    min_projection_iou: float = 0.7  # silhouette agreement required to trust the camera
+    mirror_fill: bool = True  # fill unseen faces from the mirrored view on symmetric assets
 
 
 @dataclass

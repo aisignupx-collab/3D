@@ -23,3 +23,6 @@ protobuf>=4.25
 #   pip install --no-build-isolation git+https://github.com/tatsy/torchmcubes.git
 omegaconf>=2.3
 einops>=0.7
+
+# Optional: MCP server for Claude Code / Codex / OpenCode (python mcp_server.py)
+# mcp>=1.2

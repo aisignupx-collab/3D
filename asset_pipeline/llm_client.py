@@ -5,6 +5,10 @@ Supported providers:
   * ``openai_compatible``  - vLLM, LM Studio, llama.cpp server, TGI (``/v1/chat/completions``)
   * ``openai``             - api.openai.com (same wire format as above)
   * ``anthropic``          - Claude Messages API
+  * presets on the OpenAI wire format: ``deepseek``, ``gemini``, ``openrouter``,
+    ``lmstudio``, ``vllm`` (see :data:`PRESETS`; keys come from environment variables)
+  * ``cli``                - any agent CLI (Claude Code, Codex, OpenCode, ...) via a command
+    template; the prompt goes to stdin or replaces ``{prompt}``
 
 Only ``requests`` is required; no vendor SDKs.
 """
@@ -17,6 +21,9 @@ import logging
 import mimetypes
 import os
 import re
+import shlex
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Union
 
@@ -64,6 +71,17 @@ def extract_json(text: str) -> Any:
     raise ValueError(f"no JSON found in LLM response: {text[:200]!r}")
 
 
+# OpenAI-wire-format services: provider -> (API root, default API-key env var)
+PRESETS = {
+    "deepseek": ("https://api.deepseek.com/v1", "DEEPSEEK_API_KEY"),  # deepseek-chat / deepseek-reasoner
+    "gemini": ("https://generativelanguage.googleapis.com/v1beta/openai", "GEMINI_API_KEY"),  # gemini-*-flash
+    "openrouter": ("https://openrouter.ai/api/v1", "OPENROUTER_API_KEY"),  # any hosted model, one key
+    "lmstudio": ("http://localhost:1234/v1", ""),
+    "vllm": ("http://localhost:8000/v1", ""),
+}
+OLLAMA_DEFAULT_URL = "http://localhost:11434"
+
+
 class LLMClient:
     def __init__(
         self,
@@ -74,6 +92,7 @@ class LLMClient:
         temperature: float = 0.2,
         max_tokens: int = 2048,
         timeout_s: int = 300,
+        command: str = "",
     ):
         self.provider = provider.lower()
         self.model = model
@@ -81,8 +100,17 @@ class LLMClient:
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.timeout_s = timeout_s
+        self.command = command
         self.api_key = os.environ.get(api_key_env, "") if api_key_env else ""
-        if self.provider == "anthropic":
+        if self.provider in PRESETS:
+            root, key_env = PRESETS[self.provider]
+            if not self.base_url or self.base_url == OLLAMA_DEFAULT_URL:
+                self.base_url = root
+            self.api_key = self.api_key or (os.environ.get(key_env, "") if key_env else "")
+        elif self.provider == "cli":
+            if not command:
+                raise ValueError("provider 'cli' needs a command, e.g. \"claude -p {prompt}\"")
+        elif self.provider == "anthropic":
             self.base_url = self.base_url or "https://api.anthropic.com"
             self.api_key = self.api_key or os.environ.get("ANTHROPIC_API_KEY", "")
         elif self.provider == "openai":
@@ -101,6 +129,7 @@ class LLMClient:
             temperature=cfg.temperature,
             max_tokens=cfg.max_tokens,
             timeout_s=cfg.timeout_s,
+            command=getattr(cfg, "command", ""),
         )
 
     # ------------------------------------------------------------------ public
@@ -121,7 +150,8 @@ class LLMClient:
             "openai_compatible": self._chat_openai,
             "openai": self._chat_openai,
             "anthropic": self._chat_anthropic,
-        }[self.provider]
+            "cli": self._chat_cli,
+        }.get(self.provider, self._chat_openai)  # presets speak the OpenAI format
         log.debug("LLM %s/%s request (%d images)", self.provider, self.model, len(images))
         return handler(prompt, system, images, json_mode)
 
@@ -154,6 +184,8 @@ class LLMClient:
                 r = requests.get(f"{self.base_url}/api/tags", timeout=5)
             elif self.provider == "anthropic":
                 return bool(self.api_key)
+            elif self.provider == "cli":
+                return shutil.which(shlex.split(self.command)[0]) is not None
             else:
                 headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
                 r = requests.get(f"{self._openai_root()}/models", headers=headers, timeout=5)
@@ -192,7 +224,9 @@ class LLMClient:
         return data.get("message", {}).get("content", "")
 
     def _openai_root(self) -> str:
-        return self.base_url if self.base_url.endswith("/v1") else f"{self.base_url}/v1"
+        if self.base_url.endswith(("/v1", "/openai")):
+            return self.base_url
+        return f"{self.base_url}/v1"
 
     def _chat_openai(self, prompt, system, images, json_mode) -> str:
         messages: List[Dict[str, Any]] = []
@@ -216,11 +250,29 @@ class LLMClient:
         }
         # response_format is not implemented by every local server, so JSON is
         # requested in the prompt and parsed leniently instead.
-        if json_mode and self.provider == "openai":
+        if json_mode and self.provider in ("openai", "deepseek", "gemini"):
             payload["response_format"] = {"type": "json_object"}
         headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
         data = self._post(f"{self._openai_root()}/chat/completions", payload, headers)
         return data["choices"][0]["message"]["content"] or ""
+
+    def _chat_cli(self, prompt, system, images, json_mode) -> str:
+        """Run an agent CLI non-interactively. Images are passed as file paths for the agent to open."""
+        text = (system + "\n\n" if system else "") + prompt
+        if images:
+            text += "\n\nLook at these image files (in this order):\n" + "\n".join(str(Path(i).resolve()) for i in images)
+        if "{prompt}" in self.command:
+            cmd = [part.replace("{prompt}", text) for part in shlex.split(self.command)]
+            stdin = None
+        else:
+            cmd, stdin = shlex.split(self.command), text
+        try:
+            proc = subprocess.run(cmd, input=stdin, capture_output=True, text=True, timeout=self.timeout_s)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise LLMError(f"cli provider failed: {exc}") from exc
+        if proc.returncode != 0:
+            raise LLMError(f"cli provider exited {proc.returncode}: {proc.stderr[-500:]}")
+        return proc.stdout
 
     def _chat_anthropic(self, prompt, system, images, json_mode) -> str:
         if not self.api_key:

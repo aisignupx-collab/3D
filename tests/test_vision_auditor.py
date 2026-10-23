@@ -5,7 +5,8 @@ import pytest
 from asset_pipeline.concept_planner import spec_from_knowledge_base
 from asset_pipeline.config import CleanupConfig, TextureConfig
 from asset_pipeline.llm_client import LLMError
-from asset_pipeline.vision_auditor import (Issue, VisionAuditor, apply_fixes, check_metrics,
+from asset_pipeline.vision_auditor import (Issue, VisionAuditor, apply_fixes, apply_rig_fixes, check_metrics,
+                                           check_rig,
                                            image_box_to_region, remap_point)
 
 from conftest import FakeLLM
@@ -133,3 +134,20 @@ def test_thin_axis_protrusions_are_tolerated():
     door = spec_from_knowledge_base("a wooden door")  # 0.9 x 0.05 x 2.1 m
     m = good_metrics(door.name, dims=(0.9, 0.07, 2.1))  # handle sticks out 2 cm
     assert check_metrics(m, door, 12000) == []
+
+
+def test_rig_checks_and_reweight_escalation():
+    assert check_rig(None) == []
+    good = {"weight_coverage": 1.0, "pose_test": {"bad_edge_fraction": 0.004}, "landmarks": {"fallback": []}}
+    assert check_rig(good) == []
+    bad = {"weight_coverage": 0.9, "pose_test": {"bad_edge_fraction": 0.12}, "landmarks": {"fallback": ["arm.L"]}}
+    issues = check_rig(bad)
+    assert [i.severity for i in issues] == ["high", "high", "low"]
+    rig = {"weights": "auto", "weight_smooth": 1}
+    rig, changes = apply_rig_fixes(rig, issues)
+    assert rig["weight_smooth"] == 3 and changes
+    rig, _ = apply_rig_fixes(rig, issues)
+    rig, changes = apply_rig_fixes(rig, issues)
+    assert rig["weights"] == "proximity"
+    assert apply_rig_fixes(rig, issues)[1] == []  # exhausted
+    assert apply_rig_fixes(rig, [Issue("geometry", "high", "x", "make_manifold")])[1] == []

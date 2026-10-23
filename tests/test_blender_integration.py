@@ -78,7 +78,7 @@ def test_generated_rig(runner, raw_mesh, tmp_path):
                                          fit_dimension="height", remesh_mode="voxel"), tag="c_char")
     rig = runner.run("rig", dict(input_blend=str(tmp_path / "c.blend"), output_blend=str(tmp_path / "r.blend"),
                                  rig_type="biped", method="generated"), tag="rig_char")
-    assert rig["weight_coverage"] > 0.95 and rig["deform_bones"] == 19
+    assert rig["weight_coverage"] > 0.95 and rig["deform_bones"] == 21
 
 
 def test_errors_are_reported(runner, tmp_path):
@@ -129,3 +129,53 @@ def test_primitive_templates(runner, raw_mesh, tmp_path):
                                      materials=mats, bake_normal=False), tag="p_tex")
     assert tex["material_ids"] and tex["normal"] == "none"
     assert 0.05 < tex["material_coverage"]["iron"] < 0.6  # bands/lock come from template IDs, not colour guesses
+
+
+@pytest.mark.parametrize("pose,method", [("A", "generated"), ("T", "generated"), ("A", "rigify")])
+def test_landmark_rig_on_mannequin(runner, tmp_path, pose, method):
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).parent / "fixtures"))
+    from make_mannequin import write_obj
+
+    raw = write_obj(str(tmp_path / "mannequin.obj"), pose)
+    runner.run("cleanup", cleanup_params(raw, tmp_path / "m.blend", dimensions=[0.6, 0.3, 1.8], fit_dimension="height",
+                                         remesh_mode="voxel", voxel_resolution=160, target_faces=6000,
+                                         import_rotation_deg=[0, 0, 0], max_tilt_correction=0.0, symmetrize=True),
+               tag=f"m_{pose}_{method}")
+    rig = runner.run("rig", dict(input_blend=str(tmp_path / "m.blend"), output_blend=str(tmp_path / "r.blend"),
+                                 rig_type="biped", method=method), tag=f"rig_{pose}_{method}")
+    lm = rig["landmarks"]
+    assert lm["pose"] == pose and lm["fallback"] == []
+    assert rig["weights"] == "bone_heat" and rig["weight_coverage"] == 1.0
+    assert rig["weight_cleanup"]["max_influences"] <= 4
+    assert rig["pose_test"]["bad_edge_fraction"] < 0.02  # arms raised, elbows/knees bent, torso twisted
+
+
+def test_blueprint_rebuilds_gun(runner, tmp_path):
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).parent / "fixtures"))
+    from make_gun import write_obj
+
+    raw = write_obj(str(tmp_path / "gun.obj"))
+    s3 = runner.run("cleanup", cleanup_params(raw, tmp_path / "g.blend", dimensions=[0.83, 0.05, 0.23],
+                                              fit_dimension="length", remesh_mode="voxel", voxel_resolution=256,
+                                              import_rotation_deg=[0, 0, 0]), tag="gun_clean")
+    res = runner.run("primitives", dict(input_blend=str(tmp_path / "g.blend"), output_blend=str(tmp_path / "gb.blend"),
+                                        components=[], classify=False, blueprint=True, materials=[]), tag="gun_bp")
+    assert res["used"] and res["source"] == "blueprint", res
+    assert res["fit_error"] < 0.02
+    assert res["blueprint"]["side"]["loops"] >= 2  # outline + the trigger-guard opening
+    body = next(iter(res["metrics"].values()))
+    assert body["watertight"]
+    for got, want in zip(body["dimensions_m"], s3["metrics"]["dimensions_m"]):
+        assert abs(got - want) < 0.02
+    # Cut the magazine out of the blueprint body: both pieces must stay closed
+    parts = [{"name": "magazine", "region_min": [0.42, 0.0, 0.0], "region_max": [0.52, 1.0, 0.6],
+              "pivot": [0.47, 0.5, 0.6], "motion": "translate", "axis": "Z", "limit_min": -0.25, "limit_max": 0}]
+    seg = runner.run("segment", dict(input_blend=str(tmp_path / "gb.blend"), output_blend=str(tmp_path / "gs.blend"),
+                                     parts=parts), tag="gun_seg")
+    assert seg["parts"] and seg["parts"][0]["watertight"] and seg["metrics"]["watertight"]

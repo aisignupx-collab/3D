@@ -48,3 +48,27 @@ def test_projection_without_views_falls_back_to_bake():
     refs = ReferenceSet(primary="input_p.png", views={"input": {"rgba": "i.png", "prepared": "i_p.png", "raw": ""}})
     params = Pipeline(cfg)._texture_params(spec_from_knowledge_base("a chair"), refs)
     assert params["albedo_source"] == "bake" and params["projections"] == []
+
+
+def test_reference_projection_and_character_settings():
+    from asset_pipeline.mesh_reconstruction import TripoSRBackend
+
+    cam = TripoSRBackend.input_camera()
+    # TripoSR's +X camera, after the export re-orientation, sits on glTF -Z with +Y up
+    assert [round(v, 6) for v in cam["position"]] == [0.0, 0.0, -1.9]
+    assert [round(v, 6) for v in cam["up"]] == [0.0, 1.0, 0.0] and cam["coords"] == "gltf"
+
+    pipe = Pipeline(Config())
+    views = {v: {"rgba": f"{v}.png", "prepared": f"{v}_p.png", "projection": f"{v}_proj.png", "raw": ""}
+             for v in ("isometric", "front", "side")}
+    refs = ReferenceSet(primary="isometric_p.png", views=views)
+    tex = pipe._texture_params(spec_from_knowledge_base("a treasure chest"), refs, cam)
+    assert tex["reference_image"] == "isometric_proj.png" and tex["reference_camera"] == cam
+    assert tex["mirror_axes"] == ["X", "Y"]
+    assert pipe._mirror_axes(spec_from_knowledge_base("mp5 smg")) == ["Y"]  # never swap muzzle and stock
+    assert pipe._mirror_axes(spec_from_knowledge_base("a knight character")) == ["X"]
+
+    knight = pipe._cleanup_params(spec_from_knowledge_base("a knight character"), cam)
+    assert knight["symmetrize"] is True and knight["max_tilt_correction"] == 0.0
+    chest = pipe._cleanup_params(spec_from_knowledge_base("a treasure chest"), cam)
+    assert chest["symmetrize"] is False and chest["reference_camera"] == cam

@@ -78,5 +78,8 @@ def test_pipeline_shape_components_and_materials():
 
 def test_no_single_shape_guess_for_weapons():
     pipe = Pipeline(Config())
-    assert pipe._shape_components(spec_from_knowledge_base("MP5 submachine gun")) is None
+    assert pipe._shape_components(spec_from_knowledge_base("MP5 submachine gun")) == []  # -> blueprint
+    cfg = Config()
+    cfg.shapes.blueprint = False
+    assert Pipeline(cfg)._shape_components(spec_from_knowledge_base("MP5 submachine gun")) is None
     assert pipe._shape_components(spec_from_knowledge_base("a longsword"))  # has a recipe

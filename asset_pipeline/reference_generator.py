@@ -11,6 +11,8 @@ Every view is written in three flavours:
   ``<view>_prepared.png``  square, centred, grey background at a fixed
                            foreground ratio - the input format TripoSR /
                            InstantMesh / OpenLRM were trained on
+  ``<view>_projection.png`` the same framing at high resolution with alpha;
+                           Stage 4 projects it back onto the asset
 """
 
 from __future__ import annotations
@@ -81,18 +83,23 @@ class ImagePreprocessor:
             raise ValueError("background removal produced an empty mask")
         return rgba.crop(bbox)
 
-    def prepare(self, rgba: Image.Image, background: Optional[List[int]] = None) -> Image.Image:
-        """Centre the object on a square canvas at ``foreground_ratio`` of its size."""
+    def prepare(self, rgba: Image.Image, background: Optional[List[int]] = None, size: Optional[int] = None,
+                transparent: bool = False) -> Image.Image:
+        """Centre the object on a square canvas at ``foreground_ratio`` of its size.
+
+        ``transparent`` keeps alpha (used for the high-res projection copy, which must
+        share the reconstruction input's framing exactly).
+        """
         crop = self.tight_crop(rgba)
-        size = self.cfg.output_size
+        size = size or self.cfg.output_size
         scale = (size * self.cfg.foreground_ratio) / max(crop.size)
         new_size = (max(1, round(crop.width * scale)), max(1, round(crop.height * scale)))
         crop = crop.resize(new_size, Image.LANCZOS)
-        bg = tuple(background or self.cfg.background_rgb) + (255,)
+        bg = (0, 0, 0, 0) if transparent else tuple(background or self.cfg.background_rgb) + (255,)
         canvas = Image.new("RGBA", (size, size), bg)
         offset = ((size - crop.width) // 2, (size - crop.height) // 2)
         canvas.alpha_composite(crop, offset)
-        return canvas.convert("RGB")
+        return canvas if transparent else canvas.convert("RGB")
 
     def process(self, image: Image.Image, view: str, out_dir: Path) -> Dict[str, str]:
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -103,7 +110,10 @@ class ImagePreprocessor:
         self.tight_crop(rgba).save(rgba_path)
         prepared_path = out_dir / f"{view}_prepared.png"
         self.prepare(rgba).save(prepared_path)
-        return {"raw": str(raw_path), "rgba": str(rgba_path), "prepared": str(prepared_path)}
+        projection_path = out_dir / f"{view}_projection.png"
+        self.prepare(rgba, size=self.cfg.projection_size, transparent=True).save(projection_path)
+        return {"raw": str(raw_path), "rgba": str(rgba_path), "prepared": str(prepared_path),
+                "projection": str(projection_path)}
 
 
 def build_concept_sheet(views: Dict[str, Dict[str, str]], out_path: Path, title: str = "") -> str:
@@ -331,8 +341,10 @@ class ReferenceGenerator:
             image = self.backend.generate(prompt, self.cfg.negative_prompt, self.seed)
             views[view] = self.preprocessor.process(image, view, out_dir)
         self.unload()
-        # Image-to-3D models want a three-quarter view; fall back to whatever we have
-        primary_view = "isometric" if "isometric" in views else next(iter(views))
+        # Hard-surface image-to-3D works best from a three-quarter view; bodies from an
+        # eye-level front view (upright reconstruction, symmetric pose for rigging)
+        preferred = "front" if spec.is_organic else "isometric"
+        primary_view = preferred if preferred in views else next(iter(views))
         sheet = build_concept_sheet(views, out_dir / "concept_sheet.png", title=spec.prompt)
         return ReferenceSet(primary=views[primary_view]["prepared"], views=views,
                             concept_sheet=sheet, source="text")
