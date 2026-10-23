@@ -84,7 +84,9 @@ class AssetSpec:
         return self.category in ("character", "creature")
 
     def to_dict(self) -> Dict[str, Any]:
-        return dataclasses.asdict(self)
+        out = dataclasses.asdict(self)
+        out["dimensions_m"] = self.dimensions  # convenience copy for tools; ignored on load
+        return out
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "AssetSpec":
@@ -459,8 +461,9 @@ class ConceptPlanner:
             raise ValueError("planner reply is not an object")
         data["prompt"] = prompt
         data["name"] = _slug(str(data.get("name") or prompt))
-        if data.get("category") not in CATEGORIES:
-            data["category"] = kb.category
+        known = lookup_knowledge_base(prompt) is not None
+        if data.get("category") not in CATEGORIES or known:
+            data["category"] = kb.category  # a recognised object keeps its reference category
         if data.get("rig_type") not in RIG_TYPES:
             data["rig_type"] = kb.rig_type if data["category"] in ("character", "creature") else "none"
         if data.get("fit_dimension") not in ("longest", "length", "width", "height"):
@@ -470,13 +473,17 @@ class ConceptPlanner:
             data[key] = float(data.get(key) or getattr(kb, key))
             if data[key] <= 0:
                 data[key] = getattr(kb, key)
-        # Cross-check scale against the knowledge base when we have a match.
-        if lookup_knowledge_base(prompt) is not None:
-            llm_max = max(data["length_m"], data["width_m"], data["height_m"])
-            kb_max = max(kb.dimensions)
-            if not (kb_max / 3.0 <= llm_max <= kb_max * 3.0):
-                log.warning("LLM scale %.2fm disagrees with reference %.2fm; using reference dims", llm_max, kb_max)
+        # Recognised objects: the reference dimensions win whenever any axis disagrees by >1.6x.
+        # Planners answer plausible-but-wrong sizes (a 0.3 m tall chest), mix up axis conventions
+        # (a sword 3 cm "tall") and vary run to run; the audit then chases those numbers.
+        if known:
+            llm_dims = [data["length_m"], data["width_m"], data["height_m"]]
+            ratios = [max(a, b) / max(min(a, b), 1e-9) for a, b in zip(llm_dims, kb.dimensions)]
+            if max(ratios) > 1.6:
+                log.warning("Planner dims %s disagree with reference %s; using reference",
+                            [round(v, 3) for v in llm_dims], kb.dimensions)
                 data["length_m"], data["width_m"], data["height_m"] = kb.dimensions
+                data["fit_dimension"] = kb.fit_dimension
                 data["scale_notes"] = kb.scale_notes
 
         materials = []
@@ -520,7 +527,9 @@ class ConceptPlanner:
         if data["category"] in ("character", "creature"):
             data["parts"] = []
         else:
-            data["parts"] = [dataclasses.asdict(p) for p in (parts or kb.parts)]
+            # Reference parts (magazine/trigger/cocking handle, wheels, lid) beat improvised ones
+            chosen = kb.parts if (known and kb.parts) else (parts or kb.parts)
+            data["parts"] = [dataclasses.asdict(p) for p in chosen]
 
         try:
             data["face_budget"] = max(500, min(int(data.get("face_budget") or kb.face_budget), 200000))

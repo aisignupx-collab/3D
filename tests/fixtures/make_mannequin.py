@@ -1,6 +1,7 @@
 """Procedural mannequin (overlapping capsules) for rigging tests: 1.8 m, faces -Y.
 
-``pose="A"`` arms 45 degrees down, ``pose="T"`` arms horizontal. Written as a
+``pose="A"`` arms 45 degrees down, ``pose="T"`` arms horizontal, ``pose="I"`` arms
+hanging against the body. Written as a
 Y-up OBJ (like real reconstruction exports); Stage 3 voxel-remeshes it into one
 watertight body.
 """
@@ -45,9 +46,10 @@ def mannequin(pose="A"):
         ((0, 0, 1.47), (0, 0, 1.55), 0.06),        # neck
         ((0, 0, 1.62), (0, 0, 1.70), 0.10),        # head
     ]
-    drop = math.radians(45 if pose == "A" else 0)
+    # A: arms 45 deg down, T: horizontal, I: hanging against the body (arms touch the torso)
+    drop = math.radians({"A": 45, "T": 0, "I": 84}[pose])
     for s in (1, -1):
-        sh = np.array([s * 0.19, 0, 1.42])
+        sh = np.array([s * (0.21 if pose == "I" else 0.19), 0, 1.42])
         d = np.array([s * math.cos(drop), 0, -math.sin(drop)])
         el = sh + d * 0.30
         wr = el + d * 0.26

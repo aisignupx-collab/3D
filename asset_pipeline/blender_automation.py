@@ -529,7 +529,43 @@ def _linear(mat3) -> "np.ndarray":
     return m
 
 
-def fit_scale(obj, target_dims, fit_dimension: str, axis_scale: dict):
+AXIS_PERMUTATIONS = [(0, 0, 0), (90, 0, 0), (0, 90, 0), (0, 0, 90), (90, 0, 90), (90, 90, 0)]
+PER_AXIS_LIMITS = (0.5, 2.0)
+
+
+def _shape_error(dims, target):
+    """Mismatch of proportions (scale-free): sum of |log ratio| of max-normalised extents."""
+    d = np.maximum(np.asarray(dims, float), 1e-9)
+    t = np.maximum(np.asarray(target, float), 1e-9)
+    return float(np.abs(np.log((d / d.max()) / (t / t.max()))).sum())
+
+
+def best_axis_permutation(obj, target_dims, min_gain: float = 0.35):
+    """90-degree rotation whose axis order best matches the spec's proportions.
+
+    Catches reconstructions lying on their side (a wall whose height ended up on Y).
+    Applied only when it improves the proportion error clearly; returns the Euler (deg).
+    """
+    lo, hi = bbox([obj])
+    dims = hi - lo
+    base = _shape_error(dims, target_dims)
+    best, best_err = (0, 0, 0), base
+    for euler in AXIS_PERMUTATIONS[1:]:
+        rot = np.abs(_euler_matrices(np.array([euler], float))[0])
+        err = _shape_error(rot @ dims, target_dims)
+        if err < best_err - 1e-9:
+            best, best_err = euler, err
+    if best == (0, 0, 0) or base - best_err < min_gain:
+        return [0.0, 0.0, 0.0], round(base, 3)
+    obj.rotation_euler = [math.radians(a) for a in best]
+    apply_transforms(obj)
+    log(f"axes: rotated {best} to match spec proportions (error {base:.2f} -> {best_err:.2f})")
+    return [float(a) for a in best], round(best_err, 3)
+
+
+def fit_scale(obj, target_dims, fit_dimension: str, axis_scale: dict, per_axis: bool = False):
+    """Uniform scale on the trusted dimension, then (``per_axis``) bounded per-axis
+    correction toward the spec, then the audit's cumulative ``axis_scale`` multipliers."""
     lo, hi = bbox([obj])
     dims = hi - lo
     if fit_dimension == "longest":
@@ -539,16 +575,25 @@ def fit_scale(obj, target_dims, fit_dimension: str, axis_scale: dict):
         current, target = float(dims[axis]), float(target_dims[axis])
     factor = target / max(current, 1e-9)
     scale = [factor, factor, factor]
+    per_axis_applied = [1.0, 1.0, 1.0]
+    if per_axis:
+        for i in range(3):
+            want = float(target_dims[i]) / max(float(dims[i]) * factor, 1e-9)
+            if abs(want - 1.0) > 0.08:  # leave small natural deviations alone
+                per_axis_applied[i] = min(max(want, PER_AXIS_LIMITS[0]), PER_AXIS_LIMITS[1])
+                scale[i] *= per_axis_applied[i]
     for axis_name, extra in (axis_scale or {}).items():
         idx = "XYZ".index(axis_name.upper())
-        scale[idx] *= min(max(float(extra), 0.7), 1.3)  # vision-driven proportion fixes, bounded
+        scale[idx] *= min(max(float(extra), PER_AXIS_LIMITS[0]), PER_AXIS_LIMITS[1])
     obj.scale = scale
     apply_transforms(obj)
     lo, hi = bbox([obj])
     dims = hi - lo
     error = [round(float(d / t - 1.0), 4) if t > 0 else 0.0 for d, t in zip(dims, target_dims)]
-    log(f"scale: x{factor:.4f}, dims {np.round(dims, 3).tolist()} vs target {target_dims}")
-    return {"scale_factor": factor, "scale_vector": scale, "dimension_error": error}
+    log(f"scale: x{factor:.4f}, per-axis {np.round(per_axis_applied, 3).tolist()}, "
+        f"dims {np.round(dims, 3).tolist()} vs target {target_dims}")
+    return {"scale_factor": factor, "scale_vector": scale, "per_axis_fit": per_axis_applied,
+            "dimension_error": error}
 
 
 def union_islands(obj):
@@ -663,6 +708,11 @@ def op_cleanup(p: dict) -> dict:
         raw, max_tilt=float(p.get("max_tilt_correction", 45.0)),
         longest_to_x=p.get("orient_longest_axis", True)) if p.get("auto_orient", True) else [0.0, 0.0, 0.0]
     frame = _linear(_euler_matrices(np.array([report["rotation_applied_deg"]], float))[0]) @ frame
+    if p.get("match_spec_axes", True) and not p.get("organic"):
+        perm, report["proportion_error"] = best_axis_permutation(raw, p["dimensions"])
+        if any(perm):
+            frame = _linear(_euler_matrices(np.array([perm], float))[0]) @ frame
+        report["axis_permutation_deg"] = perm
     if p.get("reference_camera") and p.get("auto_orient", True):
         # The side the reference image shows is the asset's front: turn it to face -Y
         yaw = front_facing_yaw(p["reference_camera"], frame, keep_long_axis=p.get("orient_longest_axis", True))
@@ -672,7 +722,8 @@ def op_cleanup(p: dict) -> dict:
             frame = _linear(_euler_matrices(np.array([[0.0, 0.0, yaw]], float))[0]) @ frame
         report["front_yaw_deg"] = yaw
     frame = _translation(ground_and_center(raw)) @ frame
-    report.update(fit_scale(raw, p["dimensions"], p["fit_dimension"], p.get("axis_scale")))
+    report.update(fit_scale(raw, p["dimensions"], p["fit_dimension"], p.get("axis_scale"),
+                            per_axis=bool(p.get("per_axis_fit", not p.get("organic")))))
     frame = _linear(np.diag(report["scale_vector"])) @ frame
     frame = _translation(ground_and_center(raw)) @ frame
     lo, hi = bbox([raw])
@@ -1890,6 +1941,56 @@ def project_reference(objs, albedo, ref, cam, res, bake_all, mirror_axes=()):
             "_reliable": reliable}
 
 
+def _shift(a, dy, dx):
+    """Shift a 2D/3D array by (dy, dx) with zero fill (no wrap-around)."""
+    out = np.zeros_like(a)
+    h, w = a.shape[:2]
+    out[max(dy, 0):h + min(dy, 0), max(dx, 0):w + min(dx, 0)] = a[max(-dy, 0):h + min(-dy, 0),
+                                                                    max(-dx, 0):w + min(-dx, 0)]
+    return out
+
+
+def fill_unbaked(objs, albedo, res, bake_all, keep=None, fallback_rgb=(0.5, 0.5, 0.5), iterations=96):
+    """Find texels inside UV islands the colour bake never reached and fill them.
+
+    Selected-to-active rays miss where the clean surface is far from the scan (lid/body
+    joints, silhouette edges) and leave black. Those texels are grown in from valid
+    neighbours; anything still empty takes the dominant material colour.
+    Returns the fraction of island texels that needed filling.
+    """
+    N = _bake_float(objs, "coverage", res, "Normal", bake_all)
+    covered = np.linalg.norm(N, axis=-1) > 0.5
+    arr = image_to_array(albedo)
+    rgb = arr[..., :3]
+    bad = covered & (rgb.max(axis=-1) < 0.015)
+    if keep is not None:
+        bad &= ~keep
+    if float(np.mean(np.asarray(fallback_rgb))) < 0.03:
+        return 0.0  # genuinely black material: dark texels are expected
+    total = int(covered.sum())
+    fraction = float(bad.sum()) / max(1, total)
+    if not bad.any():
+        return 0.0
+    valid = covered & ~bad
+    for _ in range(iterations):
+        acc = np.zeros_like(rgb)
+        cnt = np.zeros(rgb.shape[:2])
+        for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            v = _shift(valid, dy, dx)
+            acc += _shift(rgb * valid[..., None], dy, dx)
+            cnt += v
+        grow = bad & (cnt > 0)
+        if not grow.any():
+            break
+        rgb[grow] = acc[grow] / cnt[grow][:, None]
+        valid |= grow
+        bad &= ~grow
+    rgb[bad] = np.asarray(fallback_rgb, dtype=rgb.dtype)
+    arr[..., :3] = rgb
+    array_to_image(albedo, arr)
+    return round(fraction, 4)
+
+
 def resolve_camera(p, scene):
     """Prior input camera in final asset coordinates (None when the backend gave none)."""
     cam = p.get("reference_camera")
@@ -1987,6 +2088,13 @@ def op_texture(p: dict) -> dict:
                 proj["skipped"] = "silhouette does not match the reference image"
             report["projection"] = proj
             log(f"projection: IoU {iou:.3f}, {proj.get('projected_fraction', 0)} of texels")
+
+    # --- Black texels the bake never reached (QA BUG-13): measure, then fill from neighbours
+    report["unbaked_fraction"] = fill_unbaked(
+        objs, albedo, res, lambda img, t: bake_all(img, t, from_high=False), keep=reliable,
+        fallback_rgb=srgb_from_linear(dominant["base_color"]).tolist())
+    if report["unbaked_fraction"]:
+        log(f"texture: filled {report['unbaked_fraction']:.1%} unbaked texels")
 
     # --- Normal (high -> low detail transfer). Off for primitive templates by default:
     # it would re-introduce the scan's lumpiness as shading.
@@ -2506,12 +2614,26 @@ def detect_biped_landmarks(obj):
             L[f"elbow.{side}"], L[f"wrist.{side}"], L[f"hand_tip.{side}"] = elbow, wrist, tip
             detected.append(f"arm.{side}" + ("" if ok_e and ok_w else "(axis only)"))
         else:
-            reach = 0.40 * H
-            down = np.array([s * 0.5, 0.0, -0.866])  # 60 degrees below horizontal
-            L[f"elbow.{side}"] = sj + down * reach * 0.42
-            L[f"wrist.{side}"] = sj + down * reach * 0.75
-            L[f"hand_tip.{side}"] = sj + down * reach
-            fallback.append(f"arm.{side}")
+            # Arm touching the body (no separate region): the outermost point at arm height
+            # on this side is the hand; joints go on the shoulder->hand line through the limb.
+            band = pts[(s * (pts[:, 0] - cx) > 0) & (pts[:, 2] > crotch - 0.12 * H) & (pts[:, 2] < armpit)]
+            tip = band[np.argmax(s * (band[:, 0] - cx))] if len(band) else None
+            if tip is not None and s * (tip[0] - cx) > torso_half * 1.1 and np.linalg.norm(tip - sj) > 0.25 * H:
+                axis = tip - sj
+                length = float(np.linalg.norm(axis))
+                axis /= length
+                near = band[s * (band[:, 0] - cx) > torso_half * 0.9]
+                elbow, _ = _centroid_near(near, sj + 0.42 * length * axis, axis, 0.03 * H, 0.10 * H)
+                wrist, _ = _centroid_near(near, sj + 0.75 * length * axis, axis, 0.03 * H, 0.08 * H)
+                L[f"elbow.{side}"], L[f"wrist.{side}"], L[f"hand_tip.{side}"] = elbow, wrist, tip
+                detected.append(f"arm.{side}(touching body)")
+            else:
+                reach = 0.40 * H
+                down = np.array([s * 0.5, 0.0, -0.866])  # 60 degrees below horizontal
+                L[f"elbow.{side}"] = sj + down * reach * 0.42
+                L[f"wrist.{side}"] = sj + down * reach * 0.75
+                L[f"hand_tip.{side}"] = sj + down * reach
+                fallback.append(f"arm.{side}")
         leg = pts[(s * (pts[:, 0] - cx) > 0) & (pts[:, 2] < crotch)]
         if len(leg) > 50:
             top = leg[leg[:, 2] > crotch - 0.08 * H]
@@ -2675,10 +2797,39 @@ def smooth_weights(obj, repeat: int = 1, factor: float = 0.5):
             g.add([int(vi)], float(w[vi, j]), "REPLACE")
 
 
-def clean_weights(obj, max_influences: int = 4, smooth_repeat: int = 1) -> dict:
-    """Game-engine skinning rules: <= N influences per vertex, smoothed, normalised to 1."""
+def bind_unweighted(obj, arm) -> int:
+    """Give every vertex without skin weights full weight on its nearest deform bone.
+
+    Bone heat leaves a few vertices empty (inside folds, tiny islands); engines then
+    leave them frozen in place while the rest of the mesh moves.
+    """
+    empty = [v.index for v in obj.data.vertices if not any(g.weight > 1e-4 for g in v.groups)]
+    if not empty:
+        return 0
+    deform = [b for b in arm.data.bones if b.use_deform]
+    co = world_coords(obj)[empty]
+    mw = np.array(arm.matrix_world)
+    dist = np.empty((len(co), len(deform)))
+    for j, b in enumerate(deform):
+        h = mw[:3, :3] @ np.array(b.head_local) + mw[:3, 3]
+        t = mw[:3, :3] @ np.array(b.tail_local) + mw[:3, 3]
+        seg = t - h
+        tt = np.clip(((co - h) @ seg) / max(seg @ seg, 1e-12), 0, 1)
+        dist[:, j] = np.linalg.norm(co - (h + tt[:, None] * seg), axis=1)
+    nearest = dist.argmin(axis=1)
+    for vi, j in zip(empty, nearest):
+        name = deform[j].name
+        group = obj.vertex_groups.get(name) or obj.vertex_groups.new(name=name)
+        group.add([vi], 1.0, "REPLACE")
+    return len(empty)
+
+
+def clean_weights(obj, max_influences: int = 4, smooth_repeat: int = 1, arm=None) -> dict:
+    """Game-engine skinning rules: every vertex weighted, <= N influences, smoothed, normalised."""
     select_only(obj)
     done = {}
+    if arm is not None:
+        done["bound_unweighted"] = bind_unweighted(obj, arm)
     if smooth_repeat > 0:
         smooth_weights(obj, smooth_repeat)
         done["smooth"] = smooth_repeat
@@ -2692,6 +2843,7 @@ def clean_weights(obj, max_influences: int = 4, smooth_repeat: int = 1) -> dict:
             done[name] = f"failed: {exc}"
     counts = [sum(1 for g in v.groups if g.weight > 1e-4) for v in obj.data.vertices]
     done["max_influences"] = max(counts) if counts else 0
+    done["unweighted_vertices"] = sum(1 for c in counts if c == 0)
     return done
 
 
@@ -2848,7 +3000,9 @@ def op_rig(p: dict) -> dict:
         report["weights"] = "proximity"
     else:
         report["weights"] = "bone_heat"
-    report["weight_cleanup"] = clean_weights(obj, int(p.get("max_influences", 4)), int(p.get("weight_smooth", 1)))
+    report["weight_cleanup"] = clean_weights(obj, int(p.get("max_influences", 4)), int(p.get("weight_smooth", 1)),
+                                             arm=arm)
+    report["unweighted_vertices"] = report["weight_cleanup"]["unweighted_vertices"]
     report["deform_bones"] = sum(1 for b in arm.data.bones if b.use_deform)
     report["weight_coverage"] = round(weight_coverage(obj), 3)
     save_blend(p["output_blend"])  # rest pose: this is what gets exported

@@ -93,6 +93,8 @@ class LLMClient:
         max_tokens: int = 2048,
         timeout_s: int = 300,
         command: str = "",
+        seed: Optional[int] = None,
+        keep_alive: Optional[str] = None,
     ):
         self.provider = provider.lower()
         self.model = model
@@ -101,6 +103,8 @@ class LLMClient:
         self.max_tokens = max_tokens
         self.timeout_s = timeout_s
         self.command = command
+        self.seed = seed
+        self.keep_alive = keep_alive  # Ollama: "0" unloads the model right after the call (frees VRAM)
         self.api_key = os.environ.get(api_key_env, "") if api_key_env else ""
         if self.provider in PRESETS:
             root, key_env = PRESETS[self.provider]
@@ -131,6 +135,7 @@ class LLMClient:
             max_tokens=cfg.max_tokens,
             timeout_s=cfg.timeout_s,
             command=getattr(cfg, "command", ""),
+            seed=getattr(cfg, "seed", None),
         )
 
     # ------------------------------------------------------------------ public
@@ -217,10 +222,13 @@ class LLMClient:
             "model": self.model,
             "messages": messages,
             "stream": False,
-            "options": {"temperature": self.temperature, "num_predict": self.max_tokens},
+            "options": {"temperature": self.temperature, "num_predict": self.max_tokens,
+                        **({"seed": self.seed} if self.seed is not None else {})},
         }
         if json_mode:
             payload["format"] = "json"
+        if self.keep_alive is not None:
+            payload["keep_alive"] = self.keep_alive
         data = self._post(f"{self.base_url}/api/chat", payload, {})
         return data.get("message", {}).get("content", "")
 
@@ -251,6 +259,8 @@ class LLMClient:
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
         }
+        if self.seed is not None:
+            payload["seed"] = self.seed
         # response_format is not implemented by every local server, so JSON is
         # requested in the prompt and parsed leniently instead.
         if json_mode and self.provider in ("openai", "deepseek", "gemini"):

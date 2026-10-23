@@ -31,7 +31,7 @@ def test_llm_reply_is_validated_and_clamped():
         "rig_type": "dragon",
         "face_budget": "lots",
     }
-    spec = ConceptPlanner(FakeLLM([reply])).plan("mp5")
+    spec = ConceptPlanner(FakeLLM([reply])).plan("a sci-fi gadget")  # unknown object: LLM values are used
     assert spec.name == "mp5_smg"
     assert spec.materials[0].base_color == [1.0, 0.0, 0.5]
     assert spec.materials[0].metallic == 1.0
@@ -66,3 +66,22 @@ def test_spec_round_trip():
     spec = spec_from_knowledge_base("a sedan car")
     again = AssetSpec.from_dict(spec.to_dict())
     assert again == spec
+
+
+def test_reference_wins_for_known_objects():
+    # Sword "3 cm tall" (axis-convention mix-up) and a 0.3 m chest are replaced by reference dims
+    sword = ConceptPlanner(FakeLLM([{"name": "s", "category": "weapon", "length_m": 1.2, "width_m": 0.15,
+                                     "height_m": 0.03}])).plan("a longsword")
+    assert sword.dimensions == [1.0, 0.05, 0.2]
+    chest = ConceptPlanner(FakeLLM([{"name": "c", "category": "furniture", "length_m": 0.6, "width_m": 0.45,
+                                     "height_m": 0.3}])).plan("a wooden treasure chest")
+    assert chest.dimensions == [0.9, 0.55, 0.6] and chest.category == "prop"
+    # Close enough: the planner's numbers are kept
+    near = ConceptPlanner(FakeLLM([{"name": "m", "category": "weapon", "length_m": 0.7, "width_m": 0.07,
+                                    "height_m": 0.27}])).plan("an MP5 smg")
+    assert near.dimensions == [0.7, 0.07, 0.27]
+    # Improvised parts lose to the reference parts
+    mp5 = ConceptPlanner(FakeLLM([{"name": "m", "category": "weapon", "length_m": 0.68, "width_m": 0.06,
+                                   "height_m": 0.26, "parts": [{"name": "buttstock"}]}])).plan("MP5 submachine gun")
+    assert {p.name for p in mp5.parts} == {"magazine", "trigger", "cocking_handle"}
+    assert "dimensions_m" in mp5.to_dict()

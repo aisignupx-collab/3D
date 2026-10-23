@@ -31,7 +31,8 @@ class LLMConfig:
     model: str = "qwen2.5:14b-instruct"
     base_url: str = "http://localhost:11434"
     api_key_env: str = ""  # name of env var holding the key (cloud providers)
-    temperature: float = 0.2
+    temperature: float = 0.0  # deterministic plans: the same prompt should give the same asset
+    seed: int = 42
     max_tokens: int = 2048
     timeout_s: int = 300
     command: str = ""  # provider "cli": e.g. 'claude -p {prompt}', 'codex exec {prompt}', 'opencode run {prompt}'
@@ -101,7 +102,8 @@ class VisionConfig:
     model: str = "qwen2.5vl:7b"
     base_url: str = "http://localhost:11434"
     api_key_env: str = ""
-    temperature: float = 0.1
+    temperature: float = 0.0
+    seed: int = 42
     max_tokens: int = 2048
     timeout_s: int = 300
     command: str = ""

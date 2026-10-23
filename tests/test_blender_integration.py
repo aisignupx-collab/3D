@@ -149,7 +149,7 @@ def test_landmark_rig_on_mannequin(runner, tmp_path, pose, method):
     lm = rig["landmarks"]
     assert lm["pose"] == pose and lm["fallback"] == []
     assert rig["weights"] == "bone_heat" and rig["weight_coverage"] == 1.0
-    assert rig["weight_cleanup"]["max_influences"] <= 4
+    assert rig["weight_cleanup"]["max_influences"] <= 4 and rig["unweighted_vertices"] == 0
     assert rig["pose_test"]["bad_edge_fraction"] < 0.02  # arms raised, elbows/knees bent, torso twisted
 
 
@@ -179,3 +179,74 @@ def test_blueprint_rebuilds_gun(runner, tmp_path):
     seg = runner.run("segment", dict(input_blend=str(tmp_path / "gb.blend"), output_blend=str(tmp_path / "gs.blend"),
                                      parts=parts), tag="gun_seg")
     assert seg["parts"] and seg["parts"][0]["watertight"] and seg["metrics"]["watertight"]
+
+
+def test_spec_axes_and_per_axis_fit(runner, tmp_path):
+    # A wall reconstructed lying on its back (height on Y) is stood up and fitted to 10 x 2.5 x 8 m
+    lying = PrimitiveBackend(None, (10.0, 8.0, 2.5)).reconstruct("", "", tmp_path).path
+    wall = runner.run("cleanup", cleanup_params(lying, tmp_path / "w.blend", dimensions=[10.0, 2.5, 8.0],
+                                                fit_dimension="height", remesh_mode="voxel",
+                                                import_rotation_deg=[0, 0, 0]), tag="wall_axes")
+    assert any(wall["axis_permutation_deg"])
+    for got, want in zip(wall["metrics"]["dimensions_m"], [10.0, 2.5, 8.0]):
+        assert got == pytest.approx(want, rel=0.06)
+
+    # A cube-ish chest scan is fitted per axis to the chest's real proportions
+    (tmp_path / "c").mkdir()
+    cube = PrimitiveBackend(None, (1.0, 0.95, 0.9)).reconstruct("", "", tmp_path / "c").path
+    chest = runner.run("cleanup", cleanup_params(cube, tmp_path / "c.blend", dimensions=[0.9, 0.55, 0.6],
+                                                 fit_dimension="length", remesh_mode="voxel",
+                                                 import_rotation_deg=[0, 0, 0], per_axis_fit=True),
+                       tag="chest_fit")
+    for got, want in zip(chest["metrics"]["dimensions_m"], [0.9, 0.55, 0.6]):
+        assert got == pytest.approx(want, rel=0.06)
+
+    # Bodies are never re-proportioned or rotated onto their side
+    body = runner.run("cleanup", cleanup_params(cube, tmp_path / "b.blend", dimensions=[0.55, 0.3, 1.8],
+                                                fit_dimension="height", remesh_mode="voxel", organic=True,
+                                                import_rotation_deg=[0, 0, 0], max_tilt_correction=0.0),
+                      tag="body_fit")
+    assert body.get("axis_permutation_deg") is None and body["per_axis_fit"] == [1.0, 1.0, 1.0]
+
+
+def test_arms_touching_body_are_detected(runner, tmp_path):
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).parent / "fixtures"))
+    from make_mannequin import write_obj
+
+    raw = write_obj(str(tmp_path / "i.obj"), "I")
+    runner.run("cleanup", cleanup_params(raw, tmp_path / "i.blend", dimensions=[0.6, 0.3, 1.8], fit_dimension="height",
+                                         remesh_mode="voxel", voxel_resolution=160, target_faces=6000, organic=True,
+                                         import_rotation_deg=[0, 0, 0], max_tilt_correction=0.0, symmetrize=True),
+               tag="i_clean")
+    rig = runner.run("rig", dict(input_blend=str(tmp_path / "i.blend"), output_blend=str(tmp_path / "ir.blend"),
+                                 rig_type="biped", method="generated"), tag="i_rig")
+    lm = rig["landmarks"]
+    assert not any(f.startswith("arm") for f in lm["fallback"]), lm
+    assert rig["unweighted_vertices"] == 0
+
+
+def test_unbaked_texels_are_filled(runner, raw_mesh, tmp_path):
+    from asset_pipeline.shape_templates import expand_arrays, recipe_for
+
+    runner.run("cleanup", cleanup_params(raw_mesh, tmp_path / "u.blend", remesh_mode="voxel"), tag="u_clean")
+    mats = [{"name": "wood", "base_color": [0.4, 0.24, 0.11], "metallic": 0.0, "roughness": 0.7, "coverage": 1.0}]
+    runner.run("primitives", dict(input_blend=str(tmp_path / "u.blend"), output_blend=str(tmp_path / "ut.blend"),
+                                  components=[c.to_dict() for c in expand_arrays(recipe_for("treasure chest"))],
+                                  mode="primitives", materials=mats), tag="u_tmpl")
+    # A near-zero cage makes most selected-to-active rays miss the scan
+    tex = runner.run("texture", dict(input_blend=str(tmp_path / "ut.blend"), output_blend=str(tmp_path / "ux.blend"),
+                                     texture_dir=str(tmp_path / "utex"), resolution=128, uv_method="smart",
+                                     uv_angle_limit=66, island_margin=0.01, bake_margin_px=2, cage_extrusion=1e-5,
+                                     bake_samples=1, albedo_source="bake", materials=mats, bake_normal=False),
+                     tag="u_tex")
+    assert tex["unbaked_fraction"] > 0.05
+    from PIL import Image
+    import numpy as np
+
+    albedo = np.asarray(Image.open(tex["textures"]["albedo"]).convert("RGB"), dtype=float) / 255
+    # after filling, black is only left outside the UV islands (plus bake margin)
+    coverage = sum(m.get("uv_coverage", 0) for m in tex["metrics"].values())
+    assert (albedo.max(axis=-1) < 0.015).mean() <= (1 - coverage) + 0.02

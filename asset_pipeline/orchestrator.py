@@ -106,6 +106,9 @@ class Pipeline:
             return
         self.llm = LLMClient.from_config(self.cfg.llm)
         self.vlm = LLMClient.from_config(self.cfg.vision)
+        if self.cfg.pipeline.unload_models_between_stages:
+            # Ollama otherwise keeps both models resident (~15 GB) while SDXL and TripoSR load
+            self.llm.keep_alive = self.vlm.keep_alive = "0"
         if not self.llm.ping():
             log.warning("Planner LLM %s at %s is unreachable; using knowledge base",
                         self.cfg.llm.model, self.cfg.llm.base_url)
@@ -244,7 +247,9 @@ class Pipeline:
         if spec.is_organic:
             params["max_tilt_correction"] = 0.0  # yaw only: an A-pose body has no upright min box
         params.update(name=spec.name, dimensions=spec.dimensions, fit_dimension=spec.fit_dimension,
-                      axis_scale={}, reference_camera=camera,
+                      axis_scale={}, reference_camera=camera, organic=spec.is_organic,
+                      # Bodies keep their image proportions; objects are fitted to real-world size
+                      per_axis_fit=not spec.is_organic,
                       symmetrize=spec.is_organic and params.pop("symmetrize_characters"))
         params.pop("symmetrize_characters", None)
         return params
@@ -265,7 +270,8 @@ class Pipeline:
         """
         if self.cfg.shapes.mode == "mesh" or spec.is_organic:
             return None
-        comps = spec.shapes or [c.to_dict() for c in recipe_for(spec.prompt, spec.category)]
+        # Curated library recipes beat planner-improvised ones (a car must keep its wheels)
+        comps = [c.to_dict() for c in recipe_for(spec.prompt, spec.category)] or spec.shapes
         if not comps and spec.category in ELONGATED and not self.cfg.shapes.blueprint:
             return None
         return [c.to_dict() for c in expand_arrays([ShapeComponent(**c) for c in comps])]
@@ -444,7 +450,8 @@ class Pipeline:
                 renders.update({f"posed_{k}": v for k, v in posed["renders"].items()})
                 render["renders"] = renders
             report: AuditReport = auditor.audit(it, renders, render["metrics"], spec,
-                                                cleanup["target_faces"], reference_image, assembled, rig_report)
+                                                cleanup["target_faces"], reference_image, assembled, rig_report,
+                                                record.get("stage4"))
             record.update(render=render, audit=report.to_dict(), final_blend=final_blend)
             self._timed(ctx, "stage6_audit", start)
             ctx.iterations.append(record)

@@ -55,12 +55,12 @@ def test_apply_fixes_closed_loop(params):
     cleanup["remesh_mode"] = "decimate"
     issues = [Issue("geometry", "high", "holes", "make_manifold"),
               Issue("texture", "medium", "stretch", "reunwrap"),
-              Issue("proportion", "medium", "tall", "rescale_axis", {"axis": "z", "factor": 0.5}),
+              Issue("proportion", "medium", "tall", "rescale_axis", {"axis": "z", "factor": 0.3}),
               Issue("artifact", "low", "bad", None)]
     c, t, changes = apply_fixes(cleanup, texture, issues)
     assert c["remesh_mode"] == "voxel"
     assert t["uv_angle_limit"] < texture["uv_angle_limit"]
-    assert c["axis_scale"] == {"Z": 0.7}  # clamped
+    assert c["axis_scale"] == {"Z": 0.5}  # cumulative bound
     assert len(changes) == 3
     assert cleanup["remesh_mode"] == "decimate"  # inputs untouched
 
@@ -114,7 +114,28 @@ def test_audit_combines_vision_and_metrics(spec, tmp_path):
 def test_audit_survives_vision_failure(spec):
     report = VisionAuditor(FakeLLM([LLMError("timeout")]), 0.75).audit(
         1, {}, good_metrics(spec.name), spec, 12000)
-    assert report.approved and report.vision_error == "timeout"
+    # A configured vision model that fails makes the result unverified, never approved (QA BUG-5)
+    assert not report.approved and report.unverified and report.vision_error == "timeout"
+    offline = VisionAuditor(None, 0.75).audit(1, {}, good_metrics(spec.name), spec, 12000)
+    assert offline.approved and not offline.unverified  # --offline: metrics-only approval is intended
+
+
+def test_open_medium_metric_issue_blocks_approval(spec):
+    m = good_metrics(spec.name, dims=(0.68, 0.06, 0.40))  # +54% height
+    report = VisionAuditor(None, 0.75).audit(1, {}, m, spec, 12000)
+    assert not report.approved and any("Z extent" in b for b in report.blocking)
+
+
+def test_texture_checks():
+    from asset_pipeline.vision_auditor import check_texture
+
+    assert check_texture({"unbaked_fraction": 0.012}) == []  # normal seam misses, filled silently
+    [i] = check_texture({"unbaked_fraction": 0.08})
+    assert (i.severity, i.fix) == ("medium", "rebake")
+    [k] = check_texture({"unbaked_fraction": 0.3})
+    assert k.severity == "high"
+    [j] = check_texture({"projection": {"skipped": "silhouette does not match", "silhouette_iou": 0.56}})
+    assert j.severity == "low"
 
 
 def test_locate_parts_updates_regions(spec, tmp_path):
@@ -142,7 +163,9 @@ def test_rig_checks_and_reweight_escalation():
     assert check_rig(good) == []
     bad = {"weight_coverage": 0.9, "pose_test": {"bad_edge_fraction": 0.12}, "landmarks": {"fallback": ["arm.L"]}}
     issues = check_rig(bad)
-    assert [i.severity for i in issues] == ["high", "high", "low"]
+    assert [i.severity for i in issues] == ["high", "high", "medium"]  # guessed arm = unreliable rig
+    stretched = {"weight_coverage": 1.0, "pose_test": {"bad_edge_fraction": 0.01, "max_stretch": 57.8}}
+    assert [i.fix for i in check_rig(stretched)] == ["reweight"]
     rig = {"weights": "auto", "weight_smooth": 1}
     rig, changes = apply_rig_fixes(rig, issues)
     assert rig["weight_smooth"] == 3 and changes
@@ -151,3 +174,28 @@ def test_rig_checks_and_reweight_escalation():
     assert rig["weights"] == "proximity"
     assert apply_rig_fixes(rig, issues)[1] == []  # exhausted
     assert apply_rig_fixes(rig, [Issue("geometry", "high", "x", "make_manifold")])[1] == []
+
+
+def test_rescale_is_metric_only_and_stops_at_bound(params):
+    cleanup, texture = params
+    vision = Issue("proportion", "medium", "looks wide", "rescale_axis", {"axis": "Y", "factor": 9.259},
+                   source="vision")
+    _, _, changes = apply_fixes(cleanup, texture, [vision])
+    assert changes == []  # VLM factors never rescale
+    metric = Issue("proportion", "medium", "Y +329%", "rescale_axis", {"axis": "Y", "factor": 0.233})
+    c, _, changes = apply_fixes(cleanup, texture, [metric])
+    assert c["axis_scale"] == {"Y": 0.5} and changes
+    c2, _, changes = apply_fixes(c, texture, [metric])
+    assert changes == [] and c2["axis_scale"] == {"Y": 0.5}  # at the bound: no fake progress
+    grow = Issue("proportion", "medium", "hammer x2.4", "rescale_axis", {"axis": "X", "factor": 2.4})
+    c3, _, _ = apply_fixes(cleanup, texture, [grow])
+    assert c3["axis_scale"] == {"X": 2.0}
+
+
+def test_vision_proportion_issues_are_advisory():
+    issues = VisionAuditor._vision_issues({"issues": [
+        {"category": "proportion", "severity": "high", "description": "too tall", "fix": "rescale_axis",
+         "params": {"axis": "Z", "factor": 0.026}},
+        {"category": "geometry", "severity": "medium", "description": "lumpy", "fix": "reduce_noise"}]})
+    assert (issues[0].fix, issues[0].severity) == (None, "low")
+    assert issues[1].fix == "reduce_noise"
