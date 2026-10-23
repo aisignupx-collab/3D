@@ -23,7 +23,7 @@ flowchart LR
       S1["1 Concept agent<br/>LLM spec: scale, parts, materials<br/>SDXL/FLUX views + rembg"] --> S2["2 Reconstruction agent<br/>TripoSR / InstantMesh / OpenLRM"]
     end
     subgraph BL["Headless Blender (bpy)"]
-      S3["3 Topology<br/>clean, quad remesh,<br/>PCA orient, metric scale"] --> S5a["5 Segmentation cut<br/>(props: parts + pivots)"]
+      S3["3 Topology<br/>clean, quad remesh,<br/>upright + orient, metric scale"] --> S5a["5 Segmentation cut<br/>(props: parts + pivots)"]
       S5a --> S4["4 Surfacing<br/>shared UVs, PBR bake"]
       S4 --> S5b["5 Rigging<br/>(characters: Rigify / generated)"]
       S5b --> S6["6 Audit renders<br/>front/side/wire/shaded/UV-checker"]
@@ -39,7 +39,7 @@ flowchart LR
 | 1 | `concept_planner.py` | LLM turns the prompt into an `AssetSpec`: category, **real-world dimensions** (MP5 = 680 mm, doors 2.1 m), fit axis, materials (base colour / metallic / roughness), movable parts with normalised regions, pivots and motion limits, rig type, face budget, per-view diffusion prompts. A built-in knowledge base is the offline fallback and sanity-checks LLM scale (rejects answers in centimetres, etc.). |
 | 1 | `reference_generator.py` | Diffusers (SD1.5 / SDXL / FLUX) or ComfyUI API generates isometric / front / side views on white; `rembg` isolates the object; images are centred on grey at a fixed foreground ratio (the input format TripoSR/InstantMesh were trained on) and assembled into a concept sheet. Image input skips diffusion. |
 | 2 | `mesh_reconstruction.py` | TripoSR in-process on CUDA (vertex colours), InstantMesh / OpenLRM in their own venvs (pinned, conflicting deps), any other CLI model via a command template, or a no-GPU `primitive` placeholder for testing. VRAM is freed between stages. |
-| 3 | `blender_automation.py` `op_cleanup` | Merge-by-distance, degenerate/loose removal, floater removal, PCA alignment (undoes the ~45° rotation a 3/4 input view produces), grounding, uniform scale to the spec's fit dimension, BVH collision check between shells, then Quadriflow (on a voxel-remeshed manifold base, shrink-wrapped back to the source) / voxel / voxel+shrinkwrap / decimate, hole filling, smoothing, auto-smooth normals. Boolean-unions intersecting shells when not voxelising. |
+| 3 | `blender_automation.py` `op_cleanup` | Merge-by-distance, degenerate/loose removal, floater removal, upright/orientation correction (feed-forward models reconstruct in the camera frame, so a 3/4 view from above comes out yawed ~45° *and* tilted by the camera elevation; a minimum-volume bounding-box search over the convex hull undoes both), grounding, uniform scale to the spec's fit dimension, BVH collision check between shells, then Quadriflow (on a voxel-remeshed manifold base, shrink-wrapped back to the source) / voxel / voxel+shrinkwrap / decimate, hole filling, smoothing, auto-smooth normals. Boolean-unions intersecting shells when not voxelising. |
 | 5 | `op_segment` | Props/weapons/vehicles: each part is a **solid boolean cut** (`part = body ∩ box`, `body = body − box`) so both pieces stay watertight with planar mating faces; separate loose shells are split off untouched. Origin set to the pivot, parented to the body, motion limits added as constraints + custom properties (exported as glTF extras / FBX props). Optional `--print_clearance_mm` gap for multi-part 3D printing. Regions come from the planner and are refined by the vision model locating each part on a front render. |
 | 4 | `op_texture` | Smart UV project (or sharp-edge seams / lightmap pack) of body **and** parts into one layout with uniform texel density, then Cycles bakes: albedo from the raw reconstruction's vertex colours / texture (selected-to-active emission bake) or by projecting the reference views, tangent-space normal map from the high-res source, roughness/metallic derived per texel by material-ID against the spec palette. Wired into one `Principled BSDF`. 1K/2K/4K. |
 | 5 | `op_rig` | Characters/creatures: Rigify human / quadruped metarig fitted to the mesh and generated, or a generated biped/quadruped skeleton; automatic (bone-heat) weights with an inverse-distance fallback when bone heat fails. |
@@ -169,6 +169,18 @@ python main.py --dry_run --prompt "A functional MP5 submachine gun" --enable_rig
 pytest                                       # unit tests; Blender tests run when Blender is found
 ```
 
+### Troubleshooting
+
+| Symptom | Cause / fix |
+|---|---|
+| `torchmcubes must be built against an installed PyTorch` | Build without isolation: `pip install --no-build-isolation git+https://github.com/tatsy/torchmcubes.git` (needs `cmake`, `ninja`, `pybind11`, `scikit-build-core` and, for GPU marching cubes, `nvcc`). |
+| TripoSR: `Missing key(s) in state_dict: image_tokenizer.model.layers.0...` | `transformers` 5.x renamed the ViT modules. Use `transformers<5` (pinned in `requirements.txt`). |
+| `diffusers ... requires huggingface-hub>=1.x` conflict | diffusers ≥ 0.36 and transformers 4.x can't share an env. Use `diffusers<0.36` (pinned). |
+| `CUDA out of memory` in Stage 1 | `diffusion.enable_cpu_offload: true`, or an SDXL-turbo / FLUX-schnell model. Make sure Ollama isn't holding the vision model on the same GPU (`OLLAMA_KEEP_ALIVE=0`). |
+| Asset lies on its side / faces backwards | Auto-orientation fixes tilts up to `cleanup.max_tilt_correction` (45°) but can't tell which face is the front. For a backend with a different up axis, set `cleanup.import_rotation_deg` (e.g. `[90, 0, 0]`). The audit can also request a `reorient` fix. |
+| Bone heat weighting fails | Happens on non-manifold or self-intersecting meshes. The rig step falls back to proximity weights automatically; `--remesh_mode voxel` gives bone heat a clean manifold. |
+| Blender crash log in `/tmp/*.crash.txt` | Check `blender_jobs/blender_<op>.log` in the run folder. Every op writes its full log there. |
+
 ---
 
 ## Usage
@@ -243,9 +255,18 @@ If only texture parameters changed, Stage 3 and the segmentation cut are reused 
 * **Roughness and metallic maps are derived, not learned.** Each texel is classified against the
   planner's material palette. Swap in a material-estimation model by replacing `derive_pbr` in
   `blender_automation.py`.
-* Tested headless with Blender **4.2 LTS**. Version-specific API differences (auto smooth, EEVEE id,
-  importers/exporters) go through compatibility helpers, and `call_op` drops operator arguments a
-  given version doesn't support.
+* Version-specific Blender API differences (auto smooth, EEVEE id, importers/exporters) go through
+  compatibility helpers, and `call_op` drops operator arguments a given version doesn't support.
+
+### Verification status
+
+| Component | How it was verified |
+|---|---|
+| Blender Stages 3-6 + export (all remesh modes, segmentation, Rigify / generated rigs, GLB/FBX/OBJ) | Real headless runs on **Blender 4.2 LTS and 4.5 LTS** (`pytest -m blender` plus end-to-end `--dry_run`) |
+| Diffusers → rembg → TripoSR → Blender → export | Real end-to-end run on **CPU** (`sd-turbo` 1-step, TripoSR at `mc_resolution: 160`), including `--resume` |
+| Closed loop | Iteration 1 rejected as non-watertight (`--remesh_mode decimate`), fix switched to voxel remeshing, iteration 2 approved |
+| Ollama / OpenAI-compatible / Anthropic clients | Request/response wire formats tested against a local fake server, not a live model |
+| CUDA GPU paths, SDXL/FLUX, ComfyUI, InstantMesh, OpenLRM | Implemented against their documented interfaces but not executed in this environment; run `python main.py --doctor` first |
 
 ## Project layout
 

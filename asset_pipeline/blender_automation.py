@@ -410,26 +410,79 @@ def bm_cleanup(obj, merge_dist: float, min_island_ratio: float, fill_holes: bool
     return {"floaters_removed": removed, "holes_filled": filled}
 
 
-def align_principal_axis(obj):
-    """Rotate about Z so the dominant horizontal axis (PCA) lies along X.
+def _euler_matrices(angles_deg: "np.ndarray") -> "np.ndarray":
+    """(N, 3) XYZ Euler angles in degrees -> (N, 3, 3) matrices, R = Rz @ Ry @ Rx (Blender 'XYZ')."""
+    a = np.radians(angles_deg)
+    cx, cy, cz = np.cos(a).T
+    sx, sy, sz = np.sin(a).T
+    m = np.empty((len(a), 3, 3))
+    m[:, 0, 0] = cy * cz
+    m[:, 0, 1] = sx * sy * cz - cx * sz
+    m[:, 0, 2] = cx * sy * cz + sx * sz
+    m[:, 1, 0] = cy * sz
+    m[:, 1, 1] = sx * sy * sz + cx * cz
+    m[:, 1, 2] = cx * sy * sz - sx * cz
+    m[:, 2, 0] = -sy
+    m[:, 2, 1] = sx * cy
+    m[:, 2, 2] = cx * cy
+    return m
 
-    Image-to-3D models reconstruct in the camera frame, so a three-quarter
-    input view yields an asset rotated ~45 degrees; this undoes that.
+
+def _hull_points(obj, limit: int = 4000) -> "np.ndarray":
+    bm = bmesh.new()
+    bm.from_mesh(obj.data)
+    try:
+        res = bmesh.ops.convex_hull(bm, input=bm.verts, use_existing_faces=False)
+        pts = np.array([v.co[:] for v in res["geom"] if isinstance(v, bmesh.types.BMVert)])
+    except (RuntimeError, ValueError):
+        pts = np.empty((0, 3))
+    bm.free()
+    if len(pts) < 4:
+        pts = world_coords(obj)
+    if len(pts) > limit:
+        pts = pts[np.random.default_rng(0).choice(len(pts), limit, replace=False)]
+    return pts - pts.mean(axis=0)
+
+
+def _min_volume_rotation(pts, center, span, step):
+    grid = np.arange(-span, span + 1e-9, step)
+    angles = np.stack(np.meshgrid(grid, grid, grid, indexing="ij"), -1).reshape(-1, 3) + center
+    rotated = np.einsum("nij,pj->npi", _euler_matrices(angles), pts)
+    volume = np.prod(rotated.max(axis=1) - rotated.min(axis=1), axis=1)
+    # Tie-break towards the smallest rotation: symmetric shapes have many equal minima
+    volume *= 1.0 + 0.002 * np.abs(angles).sum(axis=1) / 45.0
+    return angles[int(np.argmin(volume))]
+
+
+def align_to_axes(obj, max_tilt: float = 45.0, longest_to_x: bool = True):
+    """Rotate so the object's tightest bounding box is axis-aligned, upright.
+
+    Feed-forward image-to-3D models reconstruct in the input camera's frame, so
+    a three-quarter view from above yields an asset that is both yawed (~45 deg)
+    and tilted by the camera elevation. A coarse-to-fine search for the
+    minimum-volume box over +-``max_tilt`` about each axis undoes both while
+    keeping the reconstruction's overall up direction. Optionally the longest
+    horizontal extent is then turned onto X (weapons, vehicles, walls).
     """
-    co = world_coords(obj)
-    xy = co[:, :2] - co[:, :2].mean(axis=0)
-    cov = np.cov(xy.T)
-    vals, vecs = np.linalg.eigh(cov)
-    major = vecs[:, int(np.argmax(vals))]
-    angle = -math.atan2(major[1], major[0])
-    # The eigenvector sign is arbitrary: take the smallest rotation (mod 180) so the
-    # object keeps the facing the reconstruction gave it (characters face -Y).
-    angle = (angle + math.pi / 2) % math.pi - math.pi / 2
-    if abs(math.degrees(angle)) < 1.0:
-        return 0.0
-    obj.rotation_euler = (0.0, 0.0, angle)
+    pts = _hull_points(obj)
+    best = _min_volume_rotation(pts, np.zeros(3), max_tilt, 5.0)
+    best = _min_volume_rotation(pts, best, 5.0, 1.0)
+    best = _min_volume_rotation(pts, best, 1.0, 0.25)
+    rx, ry, rz = (float(v) for v in best)
+    if longest_to_x:
+        rotated = pts @ _euler_matrices(best[None])[0].T
+        ext = rotated.max(axis=0) - rotated.min(axis=0)
+        if ext[1] > ext[0] * 1.05:
+            # Compose an extra 90 deg yaw: Rz(90) @ R
+            mat = mathutils.Matrix.Rotation(math.radians(90), 3, "Z") @ mathutils.Euler(
+                [math.radians(a) for a in (rx, ry, rz)], "XYZ").to_matrix()
+            rx, ry, rz = (math.degrees(a) for a in mat.to_euler("XYZ"))
+    if max(abs(rx), abs(ry), abs(rz)) < 0.5:
+        return [0.0, 0.0, 0.0]
+    obj.rotation_mode = "XYZ"
+    obj.rotation_euler = [math.radians(a) for a in (rx, ry, rz)]
     apply_transforms(obj)
-    return math.degrees(angle)
+    return [round(rx, 2), round(ry, 2), round(rz, 2)]
 
 
 def ground_and_center(obj, followers=()):
@@ -568,7 +621,9 @@ def op_cleanup(p: dict) -> dict:
     report = {"raw_faces": raw_faces}
     report.update(bm_cleanup(raw, p["merge_distance"] * size, p["min_island_ratio"], fill_holes=False))
 
-    report["rotation_applied_deg"] = align_principal_axis(raw) if p.get("orient_longest_axis", True) else 0.0
+    report["rotation_applied_deg"] = align_to_axes(
+        raw, max_tilt=float(p.get("max_tilt_correction", 45.0)),
+        longest_to_x=p.get("orient_longest_axis", True)) if p.get("auto_orient", True) else [0.0, 0.0, 0.0]
     ground_and_center(raw)
     report.update(fit_scale(raw, p["dimensions"], p["fit_dimension"], p.get("axis_scale")))
     ground_and_center(raw)

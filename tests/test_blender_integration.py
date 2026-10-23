@@ -41,7 +41,8 @@ def test_stage3_to_export(runner, raw_mesh, tmp_path):
     s3 = runner.run("cleanup", cleanup_params(raw_mesh, tmp_path / "s3.blend"))
     m = s3["metrics"]
     assert m["watertight"] and m["quad_ratio"] > 0.9
-    assert abs(s3["rotation_applied_deg"] + 30) < 2  # PCA undid the 30 degree import rotation
+    rx, ry, rz = s3["rotation_applied_deg"]
+    assert abs(rz + 30) < 1 and abs(rx) < 1 and abs(ry) < 1  # undid the 30 degree import yaw
     assert m["dimensions_m"][0] == pytest.approx(0.68, rel=0.01)
     assert s3["floaters_removed"] == 1
 
@@ -87,3 +88,13 @@ def test_errors_are_reported(runner, tmp_path):
         runner.run("cleanup", cleanup_params(str(tmp_path / "missing.xyz"), tmp_path / "x.blend"), tag="bad")
     result = json.loads((runner.work_dir / "result_bad.json").read_text())
     assert result["status"] == "error"
+
+
+def test_tilted_reconstruction_is_uprighted(runner, raw_mesh, tmp_path):
+    # Camera-elevation tilt + yaw, as a three-quarter view from above produces
+    s3 = runner.run("cleanup", cleanup_params(raw_mesh, tmp_path / "t.blend", import_rotation_deg=[20, -15, 30],
+                                              remesh_mode="voxel"), tag="tilted")
+    dims = s3["metrics"]["dimensions_m"]
+    assert dims[0] == pytest.approx(0.68, rel=0.01)
+    assert dims[1] == pytest.approx(0.06, rel=0.08)
+    assert dims[2] == pytest.approx(0.26, rel=0.03)

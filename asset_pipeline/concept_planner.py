@@ -287,8 +287,9 @@ def lookup_knowledge_base(prompt: str) -> Optional[Dict[str, Any]]:
 
 def default_view_prompts(prompt: str, category: str) -> Dict[str, str]:
     base = (
-        f"{prompt}, single object, isolated on a pure white background, studio product photography, "
-        "even soft lighting, sharp focus, highly detailed, physically accurate proportions"
+        f"{prompt}, single object, entire object fully in frame and centered, isolated on a pure white "
+        "background, studio product photography, even soft lighting, sharp focus, highly detailed, "
+        "physically accurate proportions"
     )
     if category in ("character", "creature"):
         base += ", full body, neutral A-pose, arms away from body"

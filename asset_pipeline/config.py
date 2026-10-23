@@ -124,7 +124,10 @@ class CleanupConfig:
     auto_smooth_angle: float = 40.0
     fix_intersections: bool = True
     fill_holes: bool = True
-    orient_longest_axis: bool = True
+    # Undo camera-frame yaw/tilt from reconstruction (min-volume box search)
+    auto_orient: bool = True
+    max_tilt_correction: float = 45.0
+    orient_longest_axis: bool = True  # then turn the longest horizontal extent onto X
     # Extra rotation applied on import, for backends with an unusual axis convention
     import_rotation_deg: List[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
 

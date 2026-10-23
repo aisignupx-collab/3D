@@ -57,6 +57,9 @@ cleanup:                     # Stage 3 (the audit loop adjusts these)
   smooth_iterations: 1
   auto_smooth_angle: 40.0
   min_island_ratio: 0.02
+  auto_orient: true          # undo camera-frame yaw/tilt (min-volume box search)
+  max_tilt_correction: 45.0
+  orient_longest_axis: true  # longest horizontal extent -> X
   import_rotation_deg: [0.0, 0.0, 0.0]
 
 texture:                     # Stage 4

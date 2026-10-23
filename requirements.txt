@@ -8,9 +8,12 @@ trimesh>=4.0
 # Stage 1: background removal (use rembg[gpu] for onnxruntime-gpu)
 rembg>=2.0.57
 
-# Stage 1: local diffusion
-diffusers>=0.30
-transformers>=4.44
+# Stage 1: local diffusion.
+# transformers 5.x renamed the ViT modules TripoSR's checkpoint was saved with, and
+# diffusers >= 0.36 needs huggingface_hub >= 1.x which transformers 4.x rejects.
+diffusers>=0.30,<0.36
+transformers>=4.44,<5
+huggingface_hub>=0.24,<1.0
 accelerate>=0.33
 safetensors>=0.4
 sentencepiece>=0.2      # FLUX T5 tokenizer
@@ -20,4 +23,3 @@ protobuf>=4.25
 #   pip install --no-build-isolation git+https://github.com/tatsy/torchmcubes.git
 omegaconf>=2.3
 einops>=0.7
-huggingface_hub>=0.24
