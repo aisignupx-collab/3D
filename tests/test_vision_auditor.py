@@ -127,3 +127,9 @@ def test_locate_parts_updates_regions(spec, tmp_path):
     mag = by_name["magazine"]
     assert mag["region_min"][0] == pytest.approx((0.34 - 0.04) / 0.68, abs=1e-6)
     assert by_name["trigger"]["region_min"] == spec.parts[1].region_min  # unchanged
+
+
+def test_thin_axis_protrusions_are_tolerated():
+    door = spec_from_knowledge_base("a wooden door")  # 0.9 x 0.05 x 2.1 m
+    m = good_metrics(door.name, dims=(0.9, 0.07, 2.1))  # handle sticks out 2 cm
+    assert check_metrics(m, door, 12000) == []

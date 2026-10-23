@@ -23,7 +23,8 @@ flowchart LR
       S1["1 Concept agent<br/>LLM spec: scale, parts, materials<br/>SDXL/FLUX views + rembg"] --> S2["2 Reconstruction agent<br/>TripoSR / InstantMesh / OpenLRM"]
     end
     subgraph BL["Headless Blender (bpy)"]
-      S3["3 Topology<br/>clean, quad remesh,<br/>upright + orient, metric scale"] --> S5a["5 Segmentation cut<br/>(props: parts + pivots)"]
+      S3["3 Topology<br/>clean, quad remesh,<br/>upright + orient, metric scale"] --> S3b["3b Shape templates<br/>rebuild from box / cylinder /<br/>cone / wedge ... recipes"]
+      S3b --> S5a["5 Segmentation cut<br/>(props: parts + pivots)"]
       S5a --> S4["4 Surfacing<br/>shared UVs, PBR bake"]
       S4 --> S5b["5 Rigging<br/>(characters: Rigify / generated)"]
       S5b --> S6["6 Audit renders<br/>front/side/wire/shaded/UV-checker"]
@@ -40,8 +41,9 @@ flowchart LR
 | 1 | `reference_generator.py` | Diffusers (SD1.5 / SDXL / FLUX) or ComfyUI API generates isometric / front / side views on white; `rembg` isolates the object; images are centred on grey at a fixed foreground ratio (the input format TripoSR/InstantMesh were trained on) and assembled into a concept sheet. Image input skips diffusion. |
 | 2 | `mesh_reconstruction.py` | TripoSR in-process on CUDA (vertex colours), InstantMesh / OpenLRM in their own venvs (pinned, conflicting deps), any other CLI model via a command template, or a no-GPU `primitive` placeholder for testing. VRAM is freed between stages. |
 | 3 | `blender_automation.py` `op_cleanup` | Merge-by-distance, degenerate/loose removal, floater removal, upright/orientation correction (feed-forward models reconstruct in the camera frame, so a 3/4 view from above comes out yawed ~45° *and* tilted by the camera elevation; a minimum-volume bounding-box search over the convex hull undoes both), grounding, uniform scale to the spec's fit dimension, BVH collision check between shells, then Quadriflow (on a voxel-remeshed manifold base, shrink-wrapped back to the source) / voxel / voxel+shrinkwrap / decimate, hole filling, smoothing, auto-smooth normals. Boolean-unions intersecting shells when not voxelising. |
+| 3b | `shape_templates.py` + `op_primitives` | Hard-surface assets are **rebuilt from clean primitives** instead of shipping the lumpy scan: box, cylinder, cone/frustum, sphere, hemisphere, half-cylinder, wedge (gable), pyramid and torus, with bevels, arrays (merlons, planks) and boolean subtraction (doorways, arches). Recipes come from the library (chest, crate, barrel, table, chair, door, castle wall/tower/gate, house, sword, spear, hammer, car, pillar), or the planner LLM composes one from the same vocabulary. With no recipe, every primitive is fitted and the best one is used if it clearly matches (e.g. a crate → box). Component extents snap to the scan, and the fit error decides whether the template replaces the scan (`shapes.mode: auto`). The scan stays in the file as the texture source. |
 | 5 | `op_segment` | Props/weapons/vehicles: each part is a **solid boolean cut** (`part = body ∩ box`, `body = body − box`) so both pieces stay watertight with planar mating faces; separate loose shells are split off untouched. Origin set to the pivot, parented to the body, motion limits added as constraints + custom properties (exported as glTF extras / FBX props). Optional `--print_clearance_mm` gap for multi-part 3D printing. Regions come from the planner and are refined by the vision model locating each part on a front render. |
-| 4 | `op_texture` | Smart UV project (or sharp-edge seams / lightmap pack) of body **and** parts into one layout with uniform texel density, then Cycles bakes: albedo from the raw reconstruction's vertex colours / texture (selected-to-active emission bake) or by projecting the reference views, tangent-space normal map from the high-res source, roughness/metallic derived per texel by material-ID against the spec palette. Wired into one `Principled BSDF`. 1K/2K/4K. |
+| 4 | `op_texture` | For templates: material IDs come from each component (iron bands → metallic, wood → rough). The scan's colours are baked on, but not its lumpy normals. Smart UV project (or sharp-edge seams / lightmap pack) of body **and** parts into one layout with uniform texel density, then Cycles bakes: albedo from the raw reconstruction's vertex colours / texture (selected-to-active emission bake) or by projecting the reference views, tangent-space normal map from the high-res source, roughness/metallic derived per texel by material-ID against the spec palette. Wired into one `Principled BSDF`. 1K/2K/4K. |
 | 5 | `op_rig` | Characters/creatures: Rigify human / quadruped metarig fitted to the mesh and generated, or a generated biped/quadruped skeleton; automatic (bone-heat) weights with an inverse-distance fallback when bone heat fails. |
 | 6 | `op_render` + `vision_auditor.py` | Renders front + side (orthographic), clay+wireframe, shaded and UV-checker views. Blender measures watertightness, non-manifold edges, floaters, dimensions vs spec, UV stretch and polycount; the vision LLM judges proportions, missing features, artefacts and texture problems against the concept sheet. Both produce issues with fixes from a closed vocabulary that `apply_fixes` maps onto new Stage 3/4 parameters. The loop repeats until approved or `max_iterations`; the best iteration is exported. |
 
@@ -195,6 +197,7 @@ pytest                                       # unit tests; Blender tests run whe
 | `--print_clearance_mm N` | cut an N mm gap between segmented parts (3D printing) |
 | `--texture_resolution 1024\|2048\|4096` | bake resolution |
 | `--remesh_mode`, `--target_faces` | Stage 3 topology overrides |
+| `--shape_mode auto\|primitives\|mesh` | rebuild from primitive templates when they fit the scan (default) / always / never |
 | `--recon_backend`, `--diffusion_backend` | swap models |
 | `--max_iterations N` | audit/refinement rounds (default 3) |
 | `--resume RUN_DIR` | re-run Stages 3-6 on an existing run (reuses the spec, references and raw mesh) |
@@ -215,6 +218,40 @@ output/a_functional_mp5_submachine_gun_20261023_101500/
 ├── blender_jobs/          # job/result JSON + full Blender log per operation
 └── export/                # <name>.fbx|glb|obj, <name>.blend, previews/
 ```
+
+### Primitive templates
+
+A crate should be a perfect box and a tower a true cylinder with a cone roof, not whatever blob the
+reconstruction produced. Stage 3b handles this:
+
+1. **Pick a recipe.** Planner LLM shapes win, then the library match for the prompt. Organic
+   assets (characters, creatures) are never templated.
+2. **Fit.** Each component's free sides snap to the scan's points (shared sides and the outer bbox
+   stay fixed, so pieces keep meeting cleanly). The composite is scored by the symmetric surface
+   distance to the scan.
+3. **Decide.** In `auto` mode, a recipe is used when its error is below `shapes.recipe_max_error`.
+   A single-shape guess must beat the stricter `classify_max_error`. Otherwise the cleaned scan is
+   kept (e.g. an MP5 whose detail no simple recipe captures).
+4. **Build.** Components are boolean-unioned into one watertight shell. `subtract` components cut
+   openings, and components with a `part` become separate objects with the spec pivot and motion
+   limits (chest lid, door leaf, car wheels).
+5. **Texture.** Stage 4 bakes the scan's colours onto the clean shapes, with the bake cage widened
+   to the measured template-to-scan distance. Each component's `material` drives the metallic and
+   roughness maps.
+
+Recipe syntax (`asset_pipeline/shape_templates.py`). Coordinates are fractions of the asset's
+bounding box (X = length, Y = depth, Z = height):
+
+```python
+{"keywords": ["tower", "turret"], "shapes": [
+    C("tower", "cylinder", (0.06, 0.06, 0), (0.94, 0.94, 0.72), axis="Z", material="stone"),
+    C("roof", "cone", (0, 0, 0.74), (1, 1, 1), axis="+Z", material="roof"),
+    C("door", "half_cylinder", (0.4, -0.05, 0), (0.6, 0.1, 0.16), axis="Y", operation="subtract"),
+]}
+```
+
+Add an entry to `RECIPES` to teach the pipeline a new asset family. The planner LLM receives the
+same primitive vocabulary and returns `shapes` in this format for anything not in the library.
 
 ### The refinement loop
 
@@ -245,6 +282,11 @@ If only texture parameters changed, Stage 3 and the segmentation cut are reused 
   views serve as audit references and as optional projection textures (`albedo_source: projection`),
   which assume the views roughly line up with the reconstructed silhouette. InstantMesh produces its
   own consistent views internally through Zero123++.
+* **Templates trade detail for cleanliness.** A template carries the scan's colours but not its
+  carved relief (set `shapes.bake_normal: true` to bake that back as a normal map, lumps included).
+  On symmetric shapes the template can't tell which face is the front, so a scan's lock or door
+  texture can land on a side face. Templates take the scan's proportions, and the audit flags
+  deviations from the spec.
 * **Segmentation is region-based.** It works well for parts that occupy a separable box (magazines,
   wheels, doors, lids, slides). Interlocking internals such as bolts inside receivers need manual
   work. Parts whose region lies wholly inside the solid are skipped and reported.
@@ -262,6 +304,7 @@ If only texture parameters changed, Stage 3 and the segmentation cut are reused 
 
 | Component | How it was verified |
 |---|---|
+| Primitive templates (12 recipes, auto-classification, parts, material-ID bake) | Real Blender runs on the placeholder and on the real TripoSR chest scan |
 | Blender Stages 3-6 + export (all remesh modes, segmentation, Rigify / generated rigs, GLB/FBX/OBJ) | Real headless runs on **Blender 4.2 LTS and 4.5 LTS** (`pytest -m blender` plus end-to-end `--dry_run`) |
 | Diffusers → rembg → TripoSR → Blender → export | Real end-to-end run on **CPU** (`sd-turbo` 1-step, TripoSR at `mc_resolution: 160`), including `--resume` |
 | Closed loop | Iteration 1 rejected as non-watertight (`--remesh_mode decimate`), fix switched to voxel remeshing, iteration 2 approved |
@@ -279,6 +322,7 @@ asset_pipeline/
   concept_planner.py            Stage 1 spec agent + knowledge base
   reference_generator.py        Stage 1 diffusion (diffusers/ComfyUI) + rembg preprocessing
   mesh_reconstruction.py        Stage 2 backends
+  shape_templates.py            Stage 3b primitive vocabulary + recipe library
   blender_automation.py         Stages 3-6 bpy operations + host-side BlenderRunner
   vision_auditor.py             Stage 6 metric/VLM audit, part localisation, fix mapping
   orchestrator.py               stage agents, refinement loop, manifest/resume

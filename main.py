@@ -47,6 +47,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     tune.add_argument("--texture_resolution", type=int, choices=[1024, 2048, 4096])
     tune.add_argument("--target_faces", type=int, help="face budget (default: planner's estimate)")
     tune.add_argument("--remesh_mode", choices=["quadriflow", "voxel", "voxel_shrinkwrap", "decimate", "none"])
+    tune.add_argument("--shape_mode", choices=["auto", "primitives", "mesh"],
+                      help="rebuild from primitive templates: when they fit / always / never")
     tune.add_argument("--max_iterations", type=int, help="Stage 6 refinement iterations")
     tune.add_argument("--blender_path", help="Blender executable")
     tune.add_argument("--seed", type=int)
@@ -83,6 +85,8 @@ def main(argv=None) -> int:
         cfg.cleanup.target_faces = args.target_faces
     if args.remesh_mode:
         cfg.cleanup.remesh_mode = args.remesh_mode
+    if args.shape_mode:
+        cfg.shapes.mode = args.shape_mode
     if args.max_iterations:
         cfg.pipeline.max_iterations = args.max_iterations
     if args.blender_path:

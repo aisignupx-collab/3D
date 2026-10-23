@@ -62,6 +62,14 @@ cleanup:                     # Stage 3 (the audit loop adjusts these)
   orient_longest_axis: true  # longest horizontal extent -> X
   import_rotation_deg: [0.0, 0.0, 0.0]
 
+shapes:                      # Stage 3b primitive templates
+  mode: auto                 # auto (use when they fit the scan) | primitives (always) | mesh (never)
+  recipe_max_error: 0.12     # max surface error (fraction of bbox diagonal) for a recipe
+  classify_max_error: 0.035  # stricter limit for single-shape guesses (box/cylinder/...)
+  union: true                # boolean-union components into one watertight shell
+  refine: true               # snap component extents to the scan
+  bake_normal: false         # bake the scan's (lumpy) normals onto the clean shapes
+
 texture:                     # Stage 4
   resolution: 2048           # 1024 | 2048 | 4096
   uv_method: smart           # smart | seams | lightmap

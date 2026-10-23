@@ -29,6 +29,7 @@ from .config import Config, find_blender
 from .llm_client import LLMClient, LLMError
 from .mesh_reconstruction import MeshReconstructor
 from .reference_generator import ReferenceGenerator, ReferenceSet
+from .shape_templates import DEFAULT_MATERIALS, ShapeComponent, expand_arrays, recipe_for
 from .vision_auditor import AuditReport, VisionAuditor, apply_fixes
 
 log = logging.getLogger(__name__)
@@ -235,9 +236,61 @@ class Pipeline:
                       axis_scale={})
         return params
 
+    def _shape_components(self, spec: AssetSpec) -> Optional[List[Dict[str, Any]]]:
+        """Template recipe for Stage 3b: planner shapes > library recipe > [] (auto-classify).
+
+        None disables the stage (organic assets or shapes.mode == "mesh").
+        """
+        if self.cfg.shapes.mode == "mesh" or spec.is_organic:
+            return None
+        comps = spec.shapes or [c.to_dict() for c in recipe_for(spec.prompt, spec.category)]
+        if not comps and spec.category in ELONGATED:
+            # A single box/cylinder guess would erase a weapon's or vehicle's detail
+            return None
+        return [c.to_dict() for c in expand_arrays([ShapeComponent(**c) for c in comps])]
+
+    @staticmethod
+    def _materials(spec: AssetSpec, components: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+        """Spec palette plus PBR defaults for any material a template references."""
+        mats = [dataclasses.asdict(m) for m in spec.materials]
+        names = {m["name"] for m in mats}
+        for comp in components or []:
+            name = comp.get("material")
+            if name and name not in names and name in DEFAULT_MATERIALS:
+                mats.append(dict(name=name, coverage=0.1, **DEFAULT_MATERIALS[name]))
+                names.add(name)
+        return mats
+
+    def _shape_stage(self, runner, ctx: RunContext, blend: str, it_dir: Path, it: int,
+                     components: List[Dict[str, Any]]) -> Dict[str, Any]:
+        spec = ctx.spec
+        shapes = self.cfg.shapes
+        out = str(it_dir / "stage3b_templates.blend")
+        materials = self._materials(spec, components)
+        try:
+            result = runner.run("primitives", dict(
+                input_blend=blend, output_blend=out, components=components, mode=shapes.mode,
+                recipe_max_error=shapes.recipe_max_error, classify_max_error=shapes.classify_max_error,
+                union=shapes.union, refine=shapes.refine, materials=materials,
+                parts=[dataclasses.asdict(p) for p in spec.parts],
+                default_material=max(spec.materials, key=lambda m: m.coverage).name if spec.materials else "",
+                auto_smooth_angle=self.cfg.cleanup.auto_smooth_angle, seed=self.cfg.pipeline.seed,
+            ), tag=f"it{it}_templates")
+        except Exception as exc:  # templates are an enhancement; never lose the run over them
+            log.warning("Primitive templates failed (%s); keeping the scan mesh", exc)
+            return {"used": False, "error": str(exc)}
+        if result.get("used"):
+            result["blend"] = out
+            log.info("Rebuilt from primitive templates (%s, fit error %.3f, parts %s)",
+                     result["source"], result["fit_error"], result.get("parts_built") or "-")
+        else:
+            log.info("Templates rejected (%s fit error %.3f); keeping the cleaned scan",
+                     result.get("source"), result.get("fit_error", -1))
+        return result
+
     def _texture_params(self, spec: AssetSpec, refs: Optional[ReferenceSet]) -> Dict[str, Any]:
         params = dataclasses.asdict(self.cfg.texture)
-        params["materials"] = [dataclasses.asdict(m) for m in spec.materials]
+        params["materials"] = self._materials(spec, self._shape_components(spec))
         projections = []
         if refs and params["albedo_source"] == "projection":
             # Diffusion "side" views of long objects show their profile, i.e. Blender's XZ plane
@@ -260,7 +313,8 @@ class Pipeline:
         reference_image = ctx.references.concept_sheet if ctx.references else None
         stage5_mode = self._stage5_mode(ctx)
         located_parts = None
-        prev_cleanup, prev_geometry = None, None
+        prev_cleanup, prev_geometry, shape_result = None, None, {}
+        components = self._shape_components(spec)
         ctx.iterations = []
 
         for it in range(1, max(1, self.cfg.pipeline.max_iterations) + 1):
@@ -280,16 +334,31 @@ class Pipeline:
                 record["stage3"] = runner.run("cleanup", dict(cleanup, input_mesh=ctx.raw_mesh,
                                                               output_blend=geometry_blend), tag=f"it{it}_cleanup")
                 self._timed(ctx, "stage3_topology", start)
-                if stage5_mode == "segment":
+
+                # STAGE 3b - rebuild hard-surface assets from primitive templates
+                shape_result = {}
+                if components is not None:
+                    start = time.time()
+                    log.info("STAGE 3b - primitive templates (%s)",
+                             f"{len(components)} components" if components else "auto-classify")
+                    shape_result = self._shape_stage(runner, ctx, geometry_blend, it_dir, it, components)
+                    record["stage3b"] = shape_result
+                    if shape_result.get("used"):
+                        geometry_blend = shape_result["blend"]
+                    self._timed(ctx, "stage3b_templates", start)
+
+                built = set(shape_result.get("parts_built") or []) if shape_result.get("used") else set()
+                if stage5_mode == "segment" and any(p.name not in built for p in spec.parts):
                     # Parts are cut BEFORE surfacing so their cut faces get real UVs and
                     # body + parts share one texture set; pivots/limits are part of Stage 5.
                     start = time.time()
                     if located_parts is None:
                         located_parts = self._locate_parts(runner, auditor, geometry_blend, it_dir, spec, it)
-                    log.info("STAGE 5 - segmentation of %d parts", len(located_parts))
+                    todo = [p for p in located_parts if p["name"] not in built]
+                    log.info("STAGE 5 - segmentation of %d parts", len(todo))
                     segmented = str(it_dir / "stage5_segmented.blend")
                     record["stage5"] = runner.run("segment", dict(
-                        input_blend=geometry_blend, output_blend=segmented, parts=located_parts,
+                        input_blend=geometry_blend, output_blend=segmented, parts=todo,
                         clearance_mm=ctx.options.print_clearance_mm), tag=f"it{it}_segment")
                     geometry_blend = segmented
                     self._timed(ctx, "stage5_rigging", start)
@@ -297,6 +366,11 @@ class Pipeline:
 
             # STAGE 4
             start = time.time()
+            if shape_result.get("used"):
+                # Primitives sit up to a few cm from the lumpy scan: widen the bake cage to reach it,
+                # and skip the scan's normals so the clean shapes shade clean
+                texture = dict(texture, bake_normal=self.cfg.shapes.bake_normal,
+                               cage_extrusion=max(texture["cage_extrusion"], shape_result.get("cage_hint", 0.0)))
             log.info("STAGE 4 - UVs + PBR (%s, %dpx)", texture["uv_method"], texture["resolution"])
             s4_blend = str(it_dir / "stage4_surfacing.blend")
             record["stage4"] = runner.run("texture", dict(

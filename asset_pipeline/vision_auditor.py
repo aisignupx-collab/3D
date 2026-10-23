@@ -114,11 +114,13 @@ def check_metrics(metrics: Dict[str, Dict[str, Any]], spec: AssetSpec, face_budg
 
     dims = assembled_dims or body.get("dimensions_m")
     if dims:
+        # Thin axes need an absolute floor too: a 2 cm door handle is +40% of a 5 cm door
+        floor = 0.03 * max(spec.dimensions)
         for axis, measured, target in zip("XYZ", dims, spec.dimensions):
             if target <= 0:
                 continue
             err = measured / target - 1.0
-            if abs(err) > 0.25:
+            if abs(err) > 0.25 and abs(measured - target) > floor:
                 issues.append(Issue(
                     "proportion", "medium",
                     f"{axis} extent {measured:.3f} m vs expected {target:.3f} m ({err:+.0%})",

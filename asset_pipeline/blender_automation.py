@@ -690,6 +690,392 @@ def op_cleanup(p: dict) -> dict:
 
 
 # =============================================================================
+# Stage 3b - primitive templates (box / cylinder / cone / ... composites)
+# =============================================================================
+
+SQRT2 = math.sqrt(2.0)
+
+
+def _bisect_keep_upper(bm):
+    """Cut at z=0, keep z>=0, cap the cut, and stretch z from [0, 0.5] to [-0.5, 0.5]."""
+    geom = bm.verts[:] + bm.edges[:] + bm.faces[:]
+    res = bmesh.ops.bisect_plane(bm, geom=geom, dist=1e-6, plane_co=(0, 0, 0), plane_no=(0, 0, 1),
+                                 clear_inner=True)
+    cut_edges = [e for e in res["geom_cut"] if isinstance(e, bmesh.types.BMEdge)]
+    if cut_edges:
+        bmesh.ops.edgeloop_fill(bm, edges=cut_edges)
+    for v in bm.verts:
+        v.co.z = v.co.z * 2.0 - 0.5
+
+
+def _torus(bm, segments, thickness=0.3, minor_segments=12):
+    """Ring in XY with outer radius 0.5; the tube cross-section fills z in [-0.5, 0.5]."""
+    minor = 0.5 * min(max(thickness, 0.02), 0.5)
+    major = 0.5 - minor
+    rings = []
+    for i in range(segments):
+        a = 2 * math.pi * i / segments
+        ring = []
+        for j in range(minor_segments):
+            b = 2 * math.pi * j / minor_segments
+            r = major + minor * math.cos(b)
+            ring.append(bm.verts.new((r * math.cos(a), r * math.sin(a), 0.5 * math.sin(b))))
+        rings.append(ring)
+    for i in range(segments):
+        for j in range(minor_segments):
+            a, b = rings[i][j], rings[(i + 1) % segments][j]
+            c, d = rings[(i + 1) % segments][(j + 1) % minor_segments], rings[i][(j + 1) % minor_segments]
+            bm.faces.new((a, b, c, d))
+
+
+def _wedge(bm):
+    """Gable prism: ridge along X at the top, rectangle at the bottom."""
+    v = [bm.verts.new(co) for co in ((-0.5, -0.5, -0.5), (0.5, -0.5, -0.5), (0.5, 0.5, -0.5), (-0.5, 0.5, -0.5),
+                                     (-0.5, 0.0, 0.5), (0.5, 0.0, 0.5))]
+    for face in ((0, 3, 2, 1), (0, 1, 5, 4), (2, 3, 4, 5), (1, 2, 5), (3, 0, 4)):
+        bm.faces.new([v[i] for i in face])
+
+
+def build_unit_primitive(kind: str, segments: int = 24, taper: float = 0.0, thickness: float = 0.3):
+    """Canonical primitive filling [-0.5, 0.5]^3 with clean topology.
+
+    Main axis is +Z, except half_cylinder / wedge whose axis is X.
+    """
+    bm = bmesh.new()
+    if kind == "box":
+        bmesh.ops.create_cube(bm, size=1.0)
+    elif kind in ("cylinder", "cone"):
+        top = 0.5 if kind == "cylinder" else 0.5 * taper
+        bmesh.ops.create_cone(bm, cap_ends=True, cap_tris=False, segments=segments, radius1=0.5,
+                              radius2=max(top, 0.0), depth=1.0)
+    elif kind == "pyramid":
+        bmesh.ops.create_cone(bm, cap_ends=True, cap_tris=False, segments=4, radius1=0.5 * SQRT2,
+                              radius2=0.5 * SQRT2 * taper, depth=1.0)
+        bmesh.ops.rotate(bm, verts=bm.verts, cent=(0, 0, 0), matrix=mathutils.Matrix.Rotation(math.pi / 4, 3, "Z"))
+    elif kind in ("sphere", "hemisphere"):
+        bmesh.ops.create_uvsphere(bm, u_segments=segments, v_segments=max(6, segments // 2), radius=0.5)
+        if kind == "hemisphere":
+            _bisect_keep_upper(bm)
+    elif kind == "half_cylinder":
+        bmesh.ops.create_cone(bm, cap_ends=True, cap_tris=False, segments=segments, radius1=0.5, radius2=0.5,
+                              depth=1.0)
+        bmesh.ops.rotate(bm, verts=bm.verts, cent=(0, 0, 0), matrix=mathutils.Matrix.Rotation(math.pi / 2, 3, "Y"))
+        _bisect_keep_upper(bm)
+    elif kind == "wedge":
+        _wedge(bm)
+    elif kind == "torus":
+        _torus(bm, segments, thickness)
+    else:
+        bm.free()
+        raise ValueError(f"unknown primitive '{kind}'")
+    bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=1e-6)  # collapses cone apexes
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+    return bm
+
+
+_AXIS_ROT = {  # rotate canonical +Z onto the requested axis
+    "Z": None, "+Z": None, "-Z": ("X", math.pi),
+    "X": ("Y", math.pi / 2), "+X": ("Y", math.pi / 2), "-X": ("Y", -math.pi / 2),
+    "Y": ("X", -math.pi / 2), "+Y": ("X", -math.pi / 2), "-Y": ("X", math.pi / 2),
+}
+
+
+def component_object(comp, lo, size, material_slots):
+    """Build one ShapeComponent (dict) as a mesh object in world space."""
+    kind = comp["type"]
+    bm = build_unit_primitive(kind, int(comp.get("segments", 24)), float(comp.get("taper", 0.0)),
+                              float(comp.get("thickness", 0.3)))
+    axis = comp.get("axis", "Z").upper()
+    if kind in ("half_cylinder", "wedge"):
+        if axis.lstrip("+-") == "Y":
+            bmesh.ops.rotate(bm, verts=bm.verts, cent=(0, 0, 0),
+                             matrix=mathutils.Matrix.Rotation(math.pi / 2, 3, "Z"))
+    elif _AXIS_ROT.get(axis):
+        ax, ang = _AXIS_ROT[axis]
+        bmesh.ops.rotate(bm, verts=bm.verts, cent=(0, 0, 0), matrix=mathutils.Matrix.Rotation(ang, 3, ax))
+    rmin = lo + np.array(comp["min"], dtype=float) * size
+    rmax = lo + np.array(comp["max"], dtype=float) * size
+    dims = np.maximum(rmax - rmin, 1e-5)
+    bmesh.ops.scale(bm, vec=dims.tolist(), verts=bm.verts)
+    bevel = float(comp.get("bevel", 0.0))
+    if bevel > 0 and kind in ("box", "wedge", "pyramid"):
+        bmesh.ops.bevel(bm, geom=bm.verts[:] + bm.edges[:], offset=bevel * float(dims.min()) * 0.5,
+                        offset_type="OFFSET", segments=2, profile=0.5, affect="EDGES", clamp_overlap=True)
+    rot = comp.get("rotation_deg") or [0, 0, 0]
+    if any(abs(a) > 1e-6 for a in rot):
+        mat = mathutils.Euler([math.radians(a) for a in rot], "XYZ").to_matrix()
+        bmesh.ops.rotate(bm, verts=bm.verts, cent=(0, 0, 0), matrix=mat)
+    bmesh.ops.translate(bm, vec=((rmin + rmax) / 2.0).tolist(), verts=bm.verts)
+    me = bpy.data.meshes.new(comp.get("name", kind))
+    bm.to_mesh(me)
+    bm.free()
+    obj = bpy.data.objects.new(comp.get("name", kind), me)
+    bpy.context.scene.collection.objects.link(obj)
+    name = comp.get("material") or ""
+    if name:
+        mat = material_slots.get(name)
+        if mat is not None:
+            me.materials.append(mat)
+    return obj
+
+
+def sample_surface(obj, n: int, rng) -> "np.ndarray":
+    """Area-weighted random points on an object's surface (world space)."""
+    me = obj.data
+    me.calc_loop_triangles()
+    if not len(me.loop_triangles):
+        return np.empty((0, 3))
+    co = world_coords(obj)
+    tris = np.empty(len(me.loop_triangles) * 3, dtype=np.int64)
+    me.loop_triangles.foreach_get("vertices", tris)
+    tri = co[tris.reshape(-1, 3)]
+    area = 0.5 * np.linalg.norm(np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]), axis=1)
+    if area.sum() <= 0:
+        return np.empty((0, 3))
+    pick = rng.choice(len(tri), size=n, p=area / area.sum())
+    u, v = rng.random(n), rng.random(n)
+    flip = u + v > 1
+    u[flip], v[flip] = 1 - u[flip], 1 - v[flip]
+    t = tri[pick]
+    return t[:, 0] + u[:, None] * (t[:, 1] - t[:, 0]) + v[:, None] * (t[:, 2] - t[:, 0])
+
+
+def _bvh(objs):
+    from mathutils.bvhtree import BVHTree
+
+    verts, polys, offset = [], [], 0
+    for o in objs:
+        co = world_coords(o)
+        verts.extend(mathutils.Vector(c) for c in co)
+        polys.extend([offset + i for i in p.vertices] for p in o.data.polygons)
+        offset += len(co)
+    return BVHTree.FromPolygons(verts, polys)
+
+
+def fit_error(shape_objs, scan_pts, scan_bvh, diag: float, rng, n: int = 2000) -> dict:
+    """Symmetric surface distance between primitives and scan, relative to the bbox diagonal."""
+    shape_pts = np.vstack([sample_surface(o, max(64, n // max(1, len(shape_objs))), rng) for o in shape_objs])
+    shape_bvh = _bvh(shape_objs)
+    d_scan = np.array([(shape_bvh.find_nearest(mathutils.Vector(p))[3] or 0.0) for p in scan_pts])
+    d_shape = np.array([(scan_bvh.find_nearest(mathutils.Vector(p))[3] or 0.0) for p in shape_pts])
+    both = np.concatenate([d_scan, d_shape])
+    return {"error": round(float(0.5 * (d_scan.mean() + d_shape.mean()) / diag), 5),
+            "p95_m": round(float(np.percentile(both, 95)), 5)}
+
+
+def refine_components(comps, scan_norm):
+    """Snap free (non-shared, non-boundary) sides of each region to the scan's points.
+
+    ``scan_norm`` are scan points normalised to the asset bbox. Sides on the
+    outer bbox or touching a neighbouring component are left alone so pieces
+    keep meeting cleanly; each side moves at most 25% of the component size.
+    """
+    unions = [c for c in comps if c.get("operation", "union") == "union"]
+    for c in unions:
+        if not c.get("refine", True) or c.get("array_count", 1) > 1:
+            continue
+        lo, hi = np.array(c["min"], float), np.array(c["max"], float)
+        ext = hi - lo
+        free_lo = np.ones(3, bool)
+        free_hi = np.ones(3, bool)
+        for k in range(3):
+            free_lo[k] = lo[k] > 0.005
+            free_hi[k] = hi[k] < 0.995
+            for o in unions:
+                if o is c:
+                    continue
+                olo, ohi = np.array(o["min"], float), np.array(o["max"], float)
+                others = [j for j in range(3) if j != k]
+                overlap = all(olo[j] < hi[j] and ohi[j] > lo[j] for j in others)
+                if overlap and abs(lo[k] - ohi[k]) < 0.01:
+                    free_lo[k] = False
+                if overlap and abs(hi[k] - olo[k]) < 0.01:
+                    free_hi[k] = False
+        if not (free_lo.any() or free_hi.any()):
+            continue
+        grow = 0.15 * ext
+        qlo = np.where(free_lo, lo - grow, lo)
+        qhi = np.where(free_hi, hi + grow, hi)
+        inside = np.all((scan_norm >= qlo) & (scan_norm <= qhi), axis=1)
+        pts = scan_norm[inside]
+        if len(pts) < 60:
+            continue
+        p_lo, p_hi = np.percentile(pts, 2, axis=0), np.percentile(pts, 98, axis=0)
+        new_lo = np.where(free_lo, np.clip(p_lo, lo - 0.25 * ext, lo + 0.25 * ext), lo)
+        new_hi = np.where(free_hi, np.clip(p_hi, hi - 0.25 * ext, hi + 0.25 * ext), hi)
+        if np.all(new_hi - new_lo > 1e-3):
+            c["min"], c["max"] = new_lo.round(4).tolist(), new_hi.round(4).tolist()
+
+
+def _alive(obj) -> bool:
+    try:
+        return obj.name in bpy.data.objects
+    except ReferenceError:  # removed from bpy.data
+        return False
+
+
+def union_objects(objs, use_boolean: bool):
+    """Merge objects into the first one (EXACT boolean union, or a plain join)."""
+    base = objs[0]
+    rest = objs[1:]
+    if use_boolean:
+        for o in rest:
+            mod = base.modifiers.new("union", "BOOLEAN")
+            mod.operation = "UNION"
+            mod.solver = "EXACT"
+            mod.object = o
+            if hasattr(mod, "material_mode"):
+                mod.material_mode = "TRANSFER"
+            before = face_count(base)
+            apply_modifier(base, mod)
+            if face_count(base) == 0:
+                raise RuntimeError(f"boolean union with {o.name} emptied the mesh (was {before} faces)")
+            bpy.data.objects.remove(o, do_unlink=True)
+    elif rest:
+        select_only(*objs, active=base)
+        bpy.ops.object.join()
+    return base
+
+
+def subtract_objects(base, cutters):
+    for o in cutters:
+        mod = base.modifiers.new("subtract", "BOOLEAN")
+        mod.operation = "DIFFERENCE"
+        mod.solver = "EXACT"
+        mod.object = o
+        apply_modifier(base, mod)
+        bpy.data.objects.remove(o, do_unlink=True)
+
+
+CLASSIFY_CANDIDATES = [
+    {"type": "box", "bevel": 0.03}, {"type": "cylinder", "axis": "Z"}, {"type": "cylinder", "axis": "X"},
+    {"type": "cylinder", "axis": "Y"}, {"type": "cone", "axis": "+Z", "taper": 0.0},
+    {"type": "pyramid", "axis": "+Z", "taper": 0.0}, {"type": "sphere"}, {"type": "hemisphere", "axis": "+Z"},
+    {"type": "half_cylinder", "axis": "X"}, {"type": "half_cylinder", "axis": "Y"},
+    {"type": "wedge", "axis": "X"}, {"type": "wedge", "axis": "Y"},
+]
+
+
+def op_primitives(p: dict) -> dict:
+    """Replace the cleaned scan with a primitive composite when it fits.
+
+    ``components`` from a recipe/planner are refined against the scan and built;
+    with no components every single primitive is tried and the best one kept.
+    The scan stays in the file as the bake source, so Stage 4 projects its
+    colours onto the clean shapes.
+    """
+    open_blend(p["input_blend"])
+    target = find_role("target")
+    scan = find_role("bake_source") or target
+    lo, hi = bbox([target])
+    size = np.maximum(hi - lo, 1e-6)
+    diag = float(np.linalg.norm(size))
+    rng = np.random.default_rng(int(p.get("seed", 0)))
+    scan_pts = sample_surface(scan, 2000, rng)
+    scan_bvh = _bvh([scan])
+    materials = {m["name"]: m for m in p.get("materials", [])}
+    slots = {}
+    for name, m in materials.items():
+        mat = bpy.data.materials.new(f"spec:{name}")
+        mat.diffuse_color = (*m["base_color"], 1.0)
+        slots[name] = mat
+
+    comps = [dict(c) for c in p.get("components") or []]
+    report = {"mode": p.get("mode", "auto")}
+    if comps:
+        if p.get("refine", True):
+            refine_components(comps, (world_coords(scan) - lo) / size)
+        report["source"] = "recipe"
+        limit = float(p.get("recipe_max_error", 0.12))
+    else:
+        scores = {}
+        for cand in CLASSIFY_CANDIDATES:
+            comp = dict(cand, name="candidate", min=[0, 0, 0], max=[1, 1, 1])
+            obj = component_object(comp, lo, size, {})
+            key = f"{cand['type']}_{cand.get('axis', '')}".rstrip("_")
+            scores[key] = fit_error([obj], scan_pts, scan_bvh, diag, rng, n=1500)["error"]
+            bpy.data.objects.remove(obj, do_unlink=True)
+        best_key = min(scores, key=scores.get)
+        best = CLASSIFY_CANDIDATES[list(scores).index(best_key)]
+        comps = [dict(best, name="body", min=[0, 0, 0], max=[1, 1, 1], material=p.get("default_material", ""))]
+        report.update(source=f"classified:{best_key}", candidates=dict(sorted(scores.items(), key=lambda kv: kv[1])))
+        limit = float(p.get("classify_max_error", 0.035))
+        log(f"primitives: best single-shape fit {best_key} ({scores[best_key]:.4f}); ranking {report['candidates']}")
+
+    # Build groups: body ("" part) and one group per part name
+    groups = {}
+    for c in comps:
+        groups.setdefault(c.get("part") or "", []).append(c)
+    built = {}
+    for part_name, members in groups.items():
+        unions = [component_object(c, lo, size, slots) for c in members if c.get("operation", "union") == "union"]
+        cutters = [component_object(c, lo, size, slots) for c in members if c.get("operation") == "subtract"]
+        if not unions:
+            for o in cutters:
+                bpy.data.objects.remove(o, do_unlink=True)
+            continue
+        try:
+            obj = union_objects(unions, p.get("union", True))
+        except RuntimeError as exc:
+            log(f"primitives: {exc}; joining without boolean")
+            obj = union_objects([o for o in unions if _alive(o)], False)
+        subtract_objects(obj, cutters)  # openings: doors, arches, crenels
+        built[part_name] = obj
+
+    if "" not in built:
+        for o in built.values():
+            bpy.data.objects.remove(o, do_unlink=True)
+        raise RuntimeError("recipe has no body components")
+    shape_objs = list(built.values())
+    fit = fit_error(shape_objs, scan_pts, scan_bvh, diag, rng)
+    report.update(fit_error=fit["error"], fit_p95_m=fit["p95_m"],
+                  cage_hint=round(min(0.15, 1.5 * fit["p95_m"] / float(size.max())), 4))
+    use = p.get("mode", "auto") == "primitives" or fit["error"] <= limit
+    report["used"] = bool(use)
+    log(f"primitives: {report['source']} fit error {fit['error']:.4f} (limit {limit}) -> "
+        f"{'using primitives' if use else 'keeping scan mesh'}")
+    if not use:
+        for o in shape_objs:
+            bpy.data.objects.remove(o, do_unlink=True)
+        return report
+
+    name = target.name
+    bpy.data.objects.remove(target, do_unlink=True)
+    body = built[""]
+    body.name = name
+    body.data.name = name
+    body["asset_role"] = "target"
+    auto_smooth(body, float(p.get("auto_smooth_angle", 40.0)))
+    spec_parts = {sp["name"]: sp for sp in p.get("parts", [])}
+    parts_built = []
+    for part_name, obj in built.items():
+        if part_name == "":
+            continue
+        obj.name = f"{name}_{part_name}"
+        obj["asset_role"] = "part"
+        auto_smooth(obj, float(p.get("auto_smooth_angle", 40.0)))
+        sp = spec_parts.get(part_name)
+        plo, phi = bbox([obj])
+        pivot = lo + np.array(sp["pivot"], float) * size if sp else np.array(
+            [(plo[0] + phi[0]) / 2, (plo[1] + phi[1]) / 2, plo[2]])
+        bpy.context.scene.cursor.location = pivot.tolist()
+        select_only(obj)
+        bpy.ops.object.origin_set(type="ORIGIN_CURSOR")
+        obj.parent = body
+        obj.matrix_parent_inverse = body.matrix_world.inverted()
+        if sp:
+            for key in ("motion", "axis", "limit_min", "limit_max", "description"):
+                obj[key] = sp.get(key, "")
+            add_motion_limits(obj, sp)
+        parts_built.append(part_name)
+    report["parts_built"] = parts_built
+    report["components"] = comps
+    report["metrics"] = {o.name: mesh_metrics(o) for o in asset_meshes()}
+    save_blend(p["output_blend"])
+    return report
+
+
+# =============================================================================
 # Stage 4 - UV unwrap and PBR textures
 # =============================================================================
 
@@ -855,12 +1241,14 @@ def bake(obj, image, bake_type: str, high=None, cage_extrusion=0.0, margin=16, c
 
     ``clear=False`` accumulates into an image another object already baked to.
     """
-    mat = obj.active_material
-    nt = mat.node_tree
-    node = nt.nodes.new("ShaderNodeTexImage")
-    node.image = image
-    node.select = True
-    nt.nodes.active = node
+    added = []
+    for mat in {s.material for s in obj.material_slots if s.material}:
+        nt = mat.node_tree
+        node = nt.nodes.new("ShaderNodeTexImage")
+        node.image = image
+        node.select = True
+        nt.nodes.active = node
+        added.append((nt, node))
     scene = bpy.context.scene
     bake_settings = scene.render.bake
     bake_settings.margin = margin
@@ -879,7 +1267,8 @@ def bake(obj, image, bake_type: str, high=None, cage_extrusion=0.0, margin=16, c
     if bake_type == "NORMAL":
         kwargs["normal_space"] = "TANGENT"
     bpy.ops.object.bake(**kwargs)
-    nt.nodes.remove(node)
+    for nt, node in added:
+        nt.nodes.remove(node)
     if high is not None:
         high.hide_render = True
 
@@ -901,8 +1290,38 @@ def srgb_from_linear(c):
     return np.where(c <= 0.0031308, c * 12.92, 1.055 * np.power(np.maximum(c, 0), 1 / 2.4) - 0.055)
 
 
-def derive_pbr(albedo_img, rough_img, metal_img, materials):
-    """Material-ID by nearest spec colour, then roughness/metallic per pixel.
+def bake_material_ids(objs, res, names, bake_all):
+    """Bake per-face material IDs from ``spec:<name>`` slots (set by primitive templates).
+
+    Returns an (H, W) int array of indices into ``names`` (-1 = unknown), or
+    None when no object carries template materials.
+    """
+    tagged = any(s.material and s.material.name.startswith("spec:") for o in objs for s in o.material_slots)
+    if not tagged:
+        return None
+    img = bpy.data.images.new("material_ids", width=res, height=res, alpha=False, float_buffer=True)
+    img.colorspace_settings.name = "Non-Color"
+    n = len(names)
+    cache = {}
+    for o in objs:
+        if not o.material_slots:
+            o.data.materials.append(None)
+        for slot in o.material_slots:
+            key = slot.material.name[5:] if slot.material and slot.material.name.startswith("spec:") else None
+            idx = names.index(key) + 1 if key in names else 0
+            if idx not in cache:
+                mat, _, emit = emission_material(f"id_{idx}")
+                emit.inputs["Color"].default_value = (idx / (n + 1),) * 3 + (1.0,)
+                cache[idx] = mat
+            slot.material = cache[idx]
+    bake_all(img, "EMIT")
+    ids = np.rint(image_to_array(img)[..., 0] * (n + 1)).astype(np.int64) - 1
+    bpy.data.images.remove(img)
+    return np.clip(ids, -1, n - 1)
+
+
+def derive_pbr(albedo_img, rough_img, metal_img, materials, ids=None):
+    """Material-ID per texel (template IDs, else nearest spec colour), then roughness/metallic.
 
     Roughness gets a small luminance-driven variation so surfaces read as
     worn rather than flat; metallic stays binary per material, which is what
@@ -912,7 +1331,9 @@ def derive_pbr(albedo_img, rough_img, metal_img, materials):
     rgb = albedo[..., :3]
     palette = np.array([srgb_from_linear(m["base_color"]) for m in materials], dtype=np.float32)
     dist = ((rgb[:, :, None, :] - palette[None, None, :, :]) ** 2).sum(axis=-1)
-    ids = dist.argmin(axis=-1)
+    colour_ids = dist.argmin(axis=-1)
+    # Template materials are authoritative; colour clustering only fills unknown texels
+    ids = colour_ids if ids is None else np.where(ids >= 0, ids, colour_ids)
     rough_vals = np.array([m["roughness"] for m in materials], dtype=np.float32)
     metal_vals = np.array([1.0 if m["metallic"] >= 0.5 else 0.0 for m in materials], dtype=np.float32)
     lum = rgb @ np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
@@ -1002,6 +1423,11 @@ def op_texture(p: dict) -> dict:
             bake(o, image, bake_type, high=high if from_high else None, cage_extrusion=cage,
                  margin=margin, clear=(i == 0))
 
+    # --- Material IDs from primitive templates (before materials are replaced)
+    names = [m["name"] for m in materials]
+    material_ids = bake_material_ids(objs, res, names, lambda img, t: bake_all(img, t, from_high=False))
+    report["material_ids"] = material_ids is not None
+
     # --- Albedo
     source = p["albedo_source"]
     if source == "projection" and p.get("projections"):
@@ -1017,8 +1443,9 @@ def op_texture(p: dict) -> dict:
         array_to_image(albedo, np.tile(np.array(col + [1.0], dtype=np.float32), (res, res, 1)))
         report["albedo"] = "procedural"
 
-    # --- Normal (high -> low detail transfer)
-    if high is not None:
+    # --- Normal (high -> low detail transfer). Off for primitive templates by default:
+    # it would re-introduce the scan's lumpiness as shading.
+    if high is not None and p.get("bake_normal", True):
         assign_material(objs, emission_material("bake_normal")[0])
         bake_all(normal, "NORMAL", from_high=True)
         report["normal"] = "baked"
@@ -1027,7 +1454,7 @@ def op_texture(p: dict) -> dict:
         report["normal"] = "none"
 
     # --- Roughness / Metallic
-    report["material_coverage"] = derive_pbr(albedo, rough, metal, materials)
+    report["material_coverage"] = derive_pbr(albedo, rough, metal, materials, material_ids)
 
     for img, suffix in ((albedo, "albedo"), (normal, "normal"), (rough, "roughness"), (metal, "metallic")):
         if img is not None:
@@ -1680,6 +2107,7 @@ def op_export(p: dict) -> dict:
 
 OPERATIONS = {
     "cleanup": op_cleanup,
+    "primitives": op_primitives,
     "texture": op_texture,
     "segment": op_segment,
     "rig": op_rig,

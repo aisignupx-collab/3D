@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from .llm_client import LLMClient, LLMError
+from .shape_templates import RECIPE_PROMPT_HELP, validate_components
 
 log = logging.getLogger(__name__)
 
@@ -71,6 +72,8 @@ class AssetSpec:
     rig_type: str = "none"
     face_budget: int = 12000
     view_prompts: Dict[str, str] = field(default_factory=dict)
+    # Primitive template recipe (list of ShapeComponent dicts); empty = library / auto-classify
+    shapes: List[Dict[str, Any]] = field(default_factory=list)
 
     @property
     def dimensions(self) -> List[float]:
@@ -160,9 +163,9 @@ KNOWLEDGE_BASE: List[Dict[str, Any]] = [
     {
         "keywords": ["castle wall", "rampart", "battlement", "fortification", "stone wall"],
         "category": "architecture",
-        "dims": (6.0, 2.0, 8.0),
+        "dims": (10.0, 2.5, 8.0),
         "fit": "height",
-        "notes": "Curtain walls are 2-3 m thick, 6-12 m tall; crenels ~0.6 m wide, merlons ~1.8 m tall "
+        "notes": "Modular wall sections ~10 m long. Curtain walls are 2-3 m thick, 6-12 m tall; crenels ~0.6 m wide, merlons ~1.8 m tall "
         "so a 1.8 m defender is covered.",
         "materials": [MaterialSpec("stone", [0.45, 0.43, 0.40], 0.0, 0.9, 1.0)],
     },
@@ -184,8 +187,8 @@ KNOWLEDGE_BASE: List[Dict[str, Any]] = [
         "notes": "Standard interior door 2.03-2.1 m x 0.8-0.9 m so a 1.8 m character clears it.",
         "materials": [MaterialSpec("wood", [0.4, 0.25, 0.12], 0.0, 0.6, 0.9)],
         "parts": [
-            PartSpec("door_leaf", "hinged leaf", [0.02, 0.0, 0.0], [0.98, 1.0, 0.99],
-                     [0.02, 0.5, 0.5], "rotate", "Z", 0.0, 100.0),
+            PartSpec("door_leaf", "hinged leaf", [0.05, 0.0, 0.0], [0.95, 1.0, 0.97],
+                     [0.05, 0.5, 0.5], "rotate", "Z", 0.0, 100.0),
         ],
     },
     {
@@ -219,7 +222,60 @@ KNOWLEDGE_BASE: List[Dict[str, Any]] = [
         ],
     },
     {
-        "keywords": ["crate", "box", "barrel"],
+        "keywords": ["barrel", "keg", "cask"],
+        "category": "prop",
+        "dims": (0.6, 0.6, 0.9),
+        "fit": "height",
+        "notes": "Standard wooden barrel ~0.9 m tall, ~0.6 m diameter.",
+        "materials": [MaterialSpec("wood", [0.40, 0.24, 0.11], 0.0, 0.7, 0.85),
+                      MaterialSpec("iron", [0.16, 0.16, 0.17], 1.0, 0.55, 0.15)],
+    },
+    {
+        "keywords": ["tower", "turret", "castle tower", "keep"],
+        "category": "architecture",
+        "dims": (6.0, 6.0, 16.0),
+        "fit": "height",
+        "notes": "Castle towers 5-10 m in diameter and 12-25 m tall; doorways ~2.2 m tall.",
+        "materials": [MaterialSpec("stone", [0.42, 0.40, 0.37], 0.0, 0.9, 0.8),
+                      MaterialSpec("roof", [0.35, 0.12, 0.08], 0.0, 0.8, 0.2)],
+    },
+    {
+        "keywords": ["house", "hut", "cottage", "cabin", "shed"],
+        "category": "architecture",
+        "dims": (8.0, 6.0, 6.0),
+        "fit": "length",
+        "notes": "Small house ~8 x 6 m footprint, eaves ~3 m, ridge ~6 m; doors 2.1 m.",
+        "materials": [MaterialSpec("wall", [0.75, 0.70, 0.62], 0.0, 0.85, 0.7),
+                      MaterialSpec("roof", [0.35, 0.12, 0.08], 0.0, 0.8, 0.3)],
+    },
+    {
+        "keywords": ["spear", "lance", "pike", "javelin"],
+        "category": "weapon",
+        "dims": (2.2, 0.06, 0.06),
+        "fit": "length",
+        "notes": "Infantry spears 2-2.5 m; shaft ~30 mm diameter.",
+        "materials": [MaterialSpec("wood", [0.40, 0.24, 0.11], 0.0, 0.7, 0.9),
+                      MaterialSpec("steel", [0.62, 0.62, 0.64], 1.0, 0.3, 0.1)],
+    },
+    {
+        "keywords": ["hammer", "mallet", "warhammer"],
+        "category": "weapon",
+        "dims": (0.35, 0.04, 0.13),
+        "fit": "length",
+        "notes": "Claw hammers ~330 mm long; warhammers 0.6-0.9 m.",
+        "materials": [MaterialSpec("wood", [0.40, 0.24, 0.11], 0.0, 0.7, 0.7),
+                      MaterialSpec("steel", [0.62, 0.62, 0.64], 1.0, 0.3, 0.3)],
+    },
+    {
+        "keywords": ["pillar", "column", "post"],
+        "category": "architecture",
+        "dims": (0.6, 0.6, 3.0),
+        "fit": "height",
+        "notes": "Interior columns 2.7-4 m tall, 0.3-0.6 m wide.",
+        "materials": [MaterialSpec("stone", [0.42, 0.40, 0.37], 0.0, 0.9, 1.0)],
+    },
+    {
+        "keywords": ["crate", "box", "cube", "block"],
         "category": "prop",
         "dims": (0.8, 0.6, 0.6),
         "fit": "longest",
@@ -351,8 +407,14 @@ Return JSON with exactly these keys:
               "limit_min": number, "limit_max": number}}],
   "rig_type": one of {rig_types},
   "face_budget": integer triangle/quad budget for a game-ready asset,
-  "view_prompts": {{"isometric": str, "front": str, "side": str}}
+  "view_prompts": {{"isometric": str, "front": str, "side": str}},
+  "shapes": [{{"name": str, "type": primitive, "min": [x,y,z], "max": [x,y,z], "axis": "X"|"Y"|"Z"|"+Z"|"-Z"...,
+               "taper": 0-1, "bevel": 0-0.45, "operation": "union"|"subtract", "part": part name or "",
+               "material": material name, "array_count": int, "array_axis": "X"|"Y"|"Z"}}]
 }}
+
+Primitives for "shapes":
+{primitives}
 
 Rules:
 - Coordinates: X = length, Y = width, Z = height (Z up). Weapons and vehicles lie along X.
@@ -361,6 +423,10 @@ Rules:
 - List parts ONLY for mechanically separate moving pieces (magazine, trigger, bolt, wheels, doors, lids).
   Characters and creatures get no parts, they get a rig_type instead.
 - rotate limits are degrees, translate limits are metres.
+- "shapes" rebuilds hard-surface objects from clean primitives placed in the same normalised bbox
+  (a castle tower = cylinder + cone roof; a wall = box + merlons via array_count; doorways = subtract).
+  Cover the whole silhouette, give each shape a material from "materials", set "part" for shapes
+  that belong to a movable part. Use [] for characters, creatures and other organic shapes.
 - view_prompts describe the SAME object for a text-to-image model: single object, pure white background,
   studio lighting, no text. "front" and "side" must be orthographic views.
 """
@@ -377,7 +443,8 @@ class ConceptPlanner:
             return kb_spec
         try:
             data = self.llm.chat_json(
-                PLANNER_PROMPT.format(prompt=prompt, categories=list(CATEGORIES), rig_types=list(RIG_TYPES)),
+                PLANNER_PROMPT.format(prompt=prompt, categories=list(CATEGORIES), rig_types=list(RIG_TYPES),
+                                      primitives=RECIPE_PROMPT_HELP),
                 system=PLANNER_SYSTEM,
             )
             spec = self._validate(data, prompt, kb_spec)
@@ -464,4 +531,9 @@ class ConceptPlanner:
         data["view_prompts"] = {k: str(prompts.get(k) or v) for k, v in defaults.items()}
         for key in ("description", "scale_notes", "mechanics"):
             data[key] = str(data.get(key) or getattr(kb, key))
+        if data["category"] in ("character", "creature"):
+            data["shapes"] = []
+        else:
+            data["shapes"] = [c.to_dict() for c in validate_components(
+                data.get("shapes"), [m["name"] for m in data["materials"]], [p["name"] for p in data["parts"]])]
         return AssetSpec.from_dict(data)

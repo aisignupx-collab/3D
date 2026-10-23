@@ -98,3 +98,34 @@ def test_tilted_reconstruction_is_uprighted(runner, raw_mesh, tmp_path):
     assert dims[0] == pytest.approx(0.68, rel=0.01)
     assert dims[1] == pytest.approx(0.06, rel=0.08)
     assert dims[2] == pytest.approx(0.26, rel=0.03)
+
+
+def test_primitive_templates(runner, raw_mesh, tmp_path):
+    from asset_pipeline.shape_templates import expand_arrays, recipe_for
+
+    runner.run("cleanup", cleanup_params(raw_mesh, tmp_path / "p3.blend", remesh_mode="voxel"), tag="p_clean")
+    mats = [{"name": "wood", "base_color": [0.4, 0.24, 0.11], "metallic": 0.0, "roughness": 0.7, "coverage": 0.8},
+            {"name": "iron", "base_color": [0.16, 0.16, 0.17], "metallic": 1.0, "roughness": 0.5, "coverage": 0.2}]
+    # No recipe: the box-like blob must be classified as a box
+    auto = runner.run("primitives", dict(input_blend=str(tmp_path / "p3.blend"), output_blend=str(tmp_path / "a.blend"),
+                                         components=[], materials=mats, default_material="wood"), tag="p_auto")
+    assert auto["used"] and auto["source"] == "classified:box"
+    body = next(iter(auto["metrics"].values()))
+    assert body["quad_ratio"] == 1.0 and body["watertight"]
+
+    # Recipe with a separate part, arrays and booleans
+    comps = [c.to_dict() for c in expand_arrays(recipe_for("treasure chest"))]
+    parts = [{"name": "lid", "pivot": [0.5, 1.0, 0.62], "motion": "rotate", "axis": "X", "limit_min": -100,
+              "limit_max": 0}]
+    res = runner.run("primitives", dict(input_blend=str(tmp_path / "p3.blend"), output_blend=str(tmp_path / "c.blend"),
+                                        components=comps, mode="primitives", materials=mats, parts=parts),
+                     tag="p_chest")
+    assert res["used"] and res["parts_built"] == ["lid"]
+    assert all(m["watertight"] for m in res["metrics"].values())
+    tex = runner.run("texture", dict(input_blend=str(tmp_path / "c.blend"), output_blend=str(tmp_path / "ct.blend"),
+                                     texture_dir=str(tmp_path / "ctex"), resolution=128, uv_method="smart",
+                                     uv_angle_limit=66, island_margin=0.01, bake_margin_px=2,
+                                     cage_extrusion=res["cage_hint"], bake_samples=1, albedo_source="bake",
+                                     materials=mats, bake_normal=False), tag="p_tex")
+    assert tex["material_ids"] and tex["normal"] == "none"
+    assert 0.05 < tex["material_coverage"]["iron"] < 0.6  # bands/lock come from template IDs, not colour guesses

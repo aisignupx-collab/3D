@@ -133,6 +133,19 @@ class CleanupConfig:
 
 
 @dataclass
+class ShapeConfig:
+    """Stage 3b primitive templates: rebuild hard-surface assets from clean shapes."""
+
+    # auto: recipe/classified shapes when they fit the scan | primitives: always | mesh: never
+    mode: str = "auto"
+    recipe_max_error: float = 0.12  # fit error (relative to bbox diagonal) above which a recipe is rejected
+    classify_max_error: float = 0.035  # stricter: single-shape guesses must clearly match
+    union: bool = True  # boolean-union components into one watertight shell
+    refine: bool = True  # snap component extents to the scan
+    bake_normal: bool = False  # bake the scan's normals onto primitives (re-adds lumpiness)
+
+
+@dataclass
 class TextureConfig:
     """Stage 4 parameters."""
 
@@ -174,6 +187,7 @@ class Config:
     vision: VisionConfig = field(default_factory=VisionConfig)
     blender: BlenderConfig = field(default_factory=BlenderConfig)
     cleanup: CleanupConfig = field(default_factory=CleanupConfig)
+    shapes: ShapeConfig = field(default_factory=ShapeConfig)
     texture: TextureConfig = field(default_factory=TextureConfig)
     render: RenderConfig = field(default_factory=RenderConfig)
     pipeline: PipelineConfig = field(default_factory=PipelineConfig)
