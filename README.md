@@ -201,6 +201,54 @@ pytest                                       # unit tests; Blender tests run whe
 
 ---
 
+## Web UI
+
+```bash
+python webui.py                       # or double-click webui.bat (Windows) / ./webui.sh
+python webui.py --config configs/lmstudio-rtx4090.yaml --port 7860
+```
+
+The UI opens in your browser at `http://127.0.0.1:7860`. It uses the same `main.py` pipeline, so a
+run from the page and a run from the command line give the same result.
+
+* **Generate:** type a prompt and/or drop in an image, pick the format, rigging and refinement
+  rounds, then watch the live stage, progress bar and log. The result shows the approval verdict,
+  the reasons it was blocked, every audit render, a rotatable 3D preview (GLB) and downloads.
+  Runs are queued and run one at a time, because they share the GPU. Cancel stops the run,
+  Blender included.
+* **Models:** one-click setups for *all local with LM Studio*, *all local with Ollama*,
+  *DeepSeek planner + local vision* and *offline*. **Find models** asks LM Studio or Ollama which
+  models it has, and marks the vision-capable (VLM) ones and the ones already loaded. **Test a
+  reply** sends a one-line message, which catches a wrong model name before a 5-minute run. This
+  tab also picks the diffusion model (SDXL, SDXL Turbo, FLUX.1-schnell, SD Turbo, or ComfyUI) and
+  the image-to-3D backend, device and mesh detail.
+* **All settings:** every key in `asset_pipeline/config.py`, generated from the code with its
+  help text and default, plus a search box. Changed values are highlighted. **Save settings**
+  writes `config.yaml` and keeps the previous file as `config.yaml.bak`. Runs use what is on
+  screen even if you haven't saved.
+* **Runs:** every past run with its preview, score and files. **Resume / re-export** continues a
+  run or exports it in another format.
+* **System:** GPU name, VRAM use and load (live), PyTorch/CUDA, Blender, which local servers
+  (LM Studio, Ollama, ComfyUI) are running, and the doctor checks.
+
+API keys typed into the System tab stay in the UI's memory for that session and reach runs as
+environment variables. They are never written to a file. The server only answers on localhost
+(`--host 0.0.0.0` opens it to your network, without a login).
+
+### Local models with LM Studio (RTX 4090)
+
+1. In LM Studio, download a text model (e.g. *Qwen2.5 14B Instruct*, Q4_K_M) and a vision model
+   (e.g. *Qwen2.5-VL 7B Instruct*).
+2. Developer tab → **Start server** (port 1234), and enable **Just-in-time model loading**, so
+   models load on first use.
+3. In the web UI: Models → **All local: LM Studio**. It fills in both models from what LM Studio
+   offers (a text model for the planner, a VLM for the auditor). Check them with **Test a reply**.
+   Or start from `configs/lmstudio-rtx4090.yaml`.
+4. VRAM: SDXL (~10 GB), TripoSR (~6-8 GB) and a 7B VLM (~6 GB) do not all fit in 24 GB at once.
+   Keep *Unload each model before the next stage* on: the pipeline then frees diffusion and
+   TripoSR between stages and asks LM Studio to unload just-in-time-loaded models after 30 s idle.
+   Models you load by hand in LM Studio stay loaded, so unload them there if VRAM runs out.
+
 ## Usage
 
 | Flag | Meaning |
@@ -269,6 +317,28 @@ bounding box (X = length, Y = depth, Z = height):
 Add an entry to `RECIPES` to teach the pipeline a new asset family. The planner LLM receives the
 same primitive vocabulary and returns `shapes` in this format for anything not in the library.
 
+**Castles and other composite buildings (skyline layout).** A castle's layout (how many towers,
+how tall, where) differs from one castle to the next, so no fixed recipe can match it. Planner
+guesses were worse: one cylinder stretched over a four-tower castle, with a straight row of
+merlons. For `castle`, `fortress`, `palace`, `cathedral`, `church`, `temple`, … (and any
+architecture without a recipe), Stage 3b reads the layout from the scan instead:
+
+1. A top-down height map of the scan (64×64 cells, median-filtered) gives the roofline.
+2. The footprint is split at the lowest height where it separates into two or more distinct peaks.
+   The part below joins them (walls) and each peak is split again, recursively.
+3. Each peak becomes a tower: round (cylinder) or square (box), depending on how much of its
+   bounding box it fills. A **cone/pyramid roof** is added when its centre rises clearly above its
+   rim, and otherwise a crenellated top: a `merlon_ring` on round towers, merlon rows on square
+   ones.
+4. The joining mass becomes a few wall blocks (largest-rectangle cover) with merlon rows along their
+   long sides.
+
+Buildings keep the scan's footprint proportions (no per-axis fit, no axis swapping), and only their
+height is checked against the plan. Pieces never share a coplanar face (exact booleans silently
+drop pieces there). A union that still loses a piece is detected (ray parity) and rebuilt as
+separately closed shells. The `primitives` report includes `skyline: {towers, roofs,
+wall_blocks}`.
+
 ### How textures work
 
 Colour comes from up to four sources, layered best-first:
@@ -286,6 +356,15 @@ Colour comes from up to four sources, layered best-first:
 3. **Reconstruction colours.** Everything still uncovered gets TripoSR/InstantMesh colours, baked
    from the scan with a selected-to-active emission bake (blurrier, since the model predicted them
    from the same image).
+   On **templates**, faces the camera never saw (backs, roofs, the far side of a tower) get a
+   **tiling texture per material** instead (`texture.unseen_fill: tiles`). The tile is cut from the
+   reference image at real-world size: the most uniform square (no window or shadow edge) of that
+   material, de-lit and made seamless. Without a usable patch, a procedural pattern in the
+   material's colour is used: ashlar stone blocks, roof shingles, planks or grain. Tiles are
+   mapped triplanar in metres, so bricks keep the same size on every face. Two checks keep the
+   projection honest on templates: a texel takes the image colour only if the scan agrees there is
+   surface there (a turret the template lacks must not be painted onto the wall behind it), and
+   only if the pixel's colour fits that face's material (no red roof pixels on a stone wall).
 4. **Material palette.** Roughness and metallic come from per-component materials (templates) or a
    hue/saturation match against the planner's palette. Shadowed wood stays wood; only saturated
    matches count, and unseen texels take the dominant material instead of a guess.
@@ -469,6 +548,7 @@ keeps its model resident. SDXL + a 7B VLM fit together. FLUX-dev + VLM don't, so
 
 ```
 main.py                         CLI
+webui.py (webui.bat, webui.sh)  local web UI: settings, model pickers, runs, GPU status
 config.example.yaml             all settings with comments
 asset_pipeline/
   config.py                     dataclass config, YAML + env loading, Blender discovery
@@ -480,11 +560,13 @@ asset_pipeline/
   blender_automation.py         Stages 3-6 bpy operations + host-side BlenderRunner
   vision_auditor.py             Stage 6 metric/VLM audit, part localisation, fix mapping
   orchestrator.py               stage agents, refinement loop, manifest/resume
+  webui.html                    the web UI page (served by webui.py)
   doctor.py                     environment diagnostics
 mcp_server.py                   MCP tools for Claude Code / Codex / OpenCode
-configs/rtx4090.yaml            tuned settings for a 24 GB RTX 4090
+configs/rtx4090.yaml            tuned settings for a 24 GB RTX 4090 (Ollama models)
+configs/lmstudio-rtx4090.yaml   the same with LM Studio serving the planner and vision models
 scripts/inspect_export.py       (in Blender) what an engine sees in an exported GLB/FBX/OBJ
 scripts/collect_results.py      bundle runs into a QA results summary + zip
 docs/QA_TEST_PROMPT.md          brief for an AI/human tester to install, run and audit the pipeline
-tests/                          unit tests + real-Blender integration tests (fixtures: mannequin, gun)
+tests/                          unit tests + real-Blender integration tests (fixtures: mannequin, gun, castle)
 ```

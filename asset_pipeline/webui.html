@@ -1,0 +1,589 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Asset Pipeline</title>
+<link rel="icon" href="data:,">
+<script type="module" src="https://unpkg.com/@google/model-viewer@3.5.0/dist/model-viewer.min.js"></script>
+<style>
+:root {
+  --bg: #f4f5f7; --panel: #ffffff; --panel-2: #f0f2f5; --line: #dde1e7; --text: #1c2128; --muted: #5d6673;
+  --accent: #2f6fde; --accent-text: #ffffff; --ok: #1f8a4c; --warn: #b7791f; --bad: #c53030; --code: #0f1720;
+  --code-text: #d6dde6; --shadow: 0 1px 2px rgba(16, 24, 40, .06);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0f1216; --panel: #171b21; --panel-2: #1e232b; --line: #2b323c; --text: #e6e9ee; --muted: #98a2b0;
+    --accent: #5b8ff0; --accent-text: #0b0f14; --ok: #3fb77a; --warn: #e0a84a; --bad: #f06a6a; --code: #0b0e12;
+    --code-text: #cdd5df; --shadow: none;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0f1216; --panel: #171b21; --panel-2: #1e232b; --line: #2b323c; --text: #e6e9ee; --muted: #98a2b0;
+  --accent: #5b8ff0; --accent-text: #0b0f14; --ok: #3fb77a; --warn: #e0a84a; --bad: #f06a6a; --code: #0b0e12;
+  --code-text: #cdd5df; --shadow: none;
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+header { position: sticky; top: 0; z-index: 5; background: var(--panel); border-bottom: 1px solid var(--line); }
+.bar { max-width: 1280px; margin: 0 auto; padding: 10px 16px; display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
+.brand { font-weight: 650; font-size: 15px; margin-right: 8px; }
+nav { display: flex; gap: 4px; flex-wrap: wrap; }
+nav button { background: none; border: 0; color: var(--muted); padding: 6px 12px; border-radius: 6px; font: inherit; cursor: pointer; }
+nav button.on { background: var(--panel-2); color: var(--text); font-weight: 600; }
+.gpu-mini { margin-left: auto; color: var(--muted); font-size: 12px; display: flex; gap: 10px; align-items: center; }
+.meter { width: 90px; height: 6px; background: var(--panel-2); border-radius: 3px; overflow: hidden; display: inline-block; vertical-align: middle; }
+.meter > i { display: block; height: 100%; background: var(--accent); }
+main { max-width: 1280px; margin: 0 auto; padding: 16px; }
+section.tab { display: none; } section.tab.on { display: block; }
+.grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(min(320px, 100%), 1fr)); }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; box-shadow: var(--shadow); min-width: 0; }
+.card h2 { font-size: 15px; margin: 0 0 4px; } .card h3 { font-size: 13px; margin: 14px 0 6px; }
+.sub { color: var(--muted); font-size: 12.5px; margin: 0 0 12px; overflow-wrap: anywhere; }
+.hint, .card h2, .run .meta { overflow-wrap: anywhere; }
+label { display: block; font-size: 12.5px; color: var(--muted); margin: 10px 0 4px; }
+input[type=text], input[type=number], input[type=password], select, textarea {
+  width: 100%; padding: 7px 9px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel-2);
+  color: var(--text); font: inherit; min-width: 0;
+}
+textarea { min-height: 84px; resize: vertical; }
+.row { display: flex; gap: 10px; flex-wrap: wrap; } .row > * { flex: 1 1 140px; min-width: 0; }
+.check { display: flex; gap: 8px; align-items: center; color: var(--text); font-size: 13px; margin: 10px 0 0; }
+.check input { width: auto; }
+button.btn { background: var(--panel-2); color: var(--text); border: 1px solid var(--line); padding: 7px 12px; border-radius: 6px; font: inherit; cursor: pointer; }
+button.btn:hover { border-color: var(--muted); }
+button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); font-weight: 600; }
+button.danger { color: var(--bad); }
+button:disabled { opacity: .5; cursor: default; }
+.actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 14px; align-items: center; }
+.pill { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; background: var(--panel-2); color: var(--muted); border: 1px solid var(--line); }
+.pill.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, transparent); }
+.pill.bad { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 40%, transparent); }
+.pill.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, transparent); }
+.drop { border: 1.5px dashed var(--line); border-radius: 8px; padding: 14px; text-align: center; color: var(--muted); cursor: pointer; }
+.drop img { max-width: 100%; max-height: 180px; display: block; margin: 0 auto 6px; border-radius: 4px; }
+.progress { height: 8px; background: var(--panel-2); border-radius: 4px; overflow: hidden; margin: 10px 0 6px; }
+.progress > i { display: block; height: 100%; background: var(--accent); transition: width .4s; }
+pre.log { background: var(--code); color: var(--code-text); border-radius: 8px; padding: 10px; height: 280px; overflow: auto; font: 12px/1.4 ui-monospace, SFMono-Regular, Consolas, monospace; margin: 8px 0 0; white-space: pre-wrap; word-break: break-word; }
+.thumbs { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 8px; margin-top: 8px; }
+.thumbs a { display: block; background: var(--panel-2); border-radius: 6px; overflow: hidden; border: 1px solid var(--line); }
+.thumbs img { width: 100%; display: block; aspect-ratio: 1; object-fit: contain; }
+.thumbs span { display: block; font-size: 11px; color: var(--muted); padding: 2px 6px; }
+model-viewer { width: 100%; height: 360px; background: var(--panel-2); border-radius: 8px; }
+.settings-sec { border: 1px solid var(--line); border-radius: 10px; background: var(--panel); margin-bottom: 10px; }
+.settings-sec > summary { padding: 12px 16px; cursor: pointer; font-weight: 600; list-style: none; display: flex; gap: 10px; align-items: baseline; }
+.settings-sec > summary::-webkit-details-marker { display: none; }
+.settings-sec > summary small { color: var(--muted); font-weight: 400; }
+.fields { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(260px, 100%), 1fr)); gap: 4px 16px; padding: 0 16px 14px; }
+.field .help { font-size: 11.5px; color: var(--muted); margin-top: 3px; }
+.field.changed label { color: var(--accent); }
+.models { margin-top: 8px; max-height: 180px; overflow: auto; border: 1px solid var(--line); border-radius: 6px; }
+.models div { padding: 5px 9px; cursor: pointer; display: flex; justify-content: space-between; gap: 8px; border-bottom: 1px solid var(--line); font-size: 12.5px; }
+.models div:hover { background: var(--panel-2); }
+.status { font-size: 12.5px; margin-top: 8px; color: var(--muted); white-space: pre-wrap; word-break: break-word; }
+.runs { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; }
+.run { cursor: pointer; padding: 0; overflow: hidden; }
+.run img { width: 100%; aspect-ratio: 1; object-fit: contain; background: var(--panel-2); display: block; }
+.run .meta { padding: 8px 10px; font-size: 12.5px; }
+.run .meta b { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+table.kv { width: 100%; border-collapse: collapse; font-size: 13px; }
+table.kv td { padding: 5px 4px; border-bottom: 1px solid var(--line); vertical-align: top; overflow-wrap: anywhere; }
+table.kv td:first-child { color: var(--muted); width: 38%; }
+.toast { position: fixed; bottom: 16px; right: 16px; background: var(--text); color: var(--bg); padding: 9px 14px; border-radius: 8px; opacity: 0; transition: opacity .2s; pointer-events: none; max-width: calc(100% - 32px); }
+.toast.on { opacity: .95; }
+.hint { font-size: 12px; color: var(--muted); }
+.issues { margin: 6px 0 0; padding-left: 18px; font-size: 12.5px; }
+@media (max-width: 640px) { .gpu-mini { width: 100%; margin-left: 0; } main { padding: 12px 16px; } }
+</style>
+</head>
+<body>
+<header><div class="bar">
+  <span class="brand">3D Asset Pipeline</span>
+  <nav id="nav">
+    <button data-tab="generate" class="on">Generate</button>
+    <button data-tab="models">Models</button>
+    <button data-tab="settings">All settings</button>
+    <button data-tab="runs">Runs</button>
+    <button data-tab="system">System</button>
+  </nav>
+  <div class="gpu-mini" id="gpuMini">GPU: checking…</div>
+</div></header>
+
+<main>
+<!-- ============================== Generate -->
+<section class="tab on" id="tab-generate">
+  <div class="grid">
+    <div class="card">
+      <h2>New asset</h2>
+      <p class="sub">Describe it, drop in a reference image, or both.</p>
+      <label for="prompt">Prompt</label>
+      <textarea id="prompt" placeholder="a medieval stone castle with four round towers"></textarea>
+      <label>Reference image (optional)</label>
+      <div class="drop" id="drop"><span id="dropText">Click or drop an image</span></div>
+      <input type="file" id="file" accept="image/*" hidden>
+      <div class="row">
+        <div><label for="fmt">Format</label><select id="fmt"><option>glb</option><option>fbx</option><option>obj</option></select></div>
+        <div><label for="iters">Refinement rounds</label><input type="number" id="iters" min="1" max="8" value="3"></div>
+        <div><label for="shape">Templates</label><select id="shape"><option value="auto">auto (when they fit)</option><option value="primitives">always</option><option value="mesh">never (scan mesh)</option></select></div>
+        <div><label for="texres">Texture</label><select id="texres"><option>1024</option><option selected>2048</option><option>4096</option></select></div>
+      </div>
+      <label class="check"><input type="checkbox" id="rig"> Rig characters / split moving parts</label>
+      <div class="row" id="rigOpts" hidden>
+        <div><label for="rigMethod">Rig method</label><select id="rigMethod"><option>rigify</option><option>generated</option></select></div>
+        <div><label for="clearance">3D-print clearance (mm)</label><input type="number" id="clearance" min="0" step="0.1" value="0"></div>
+      </div>
+      <label class="check"><input type="checkbox" id="offline"> Offline: no planner / vision AI calls</label>
+      <label class="check"><input type="checkbox" id="dry"> Dry run: no GPU models, tests the Blender stages</label>
+      <div class="actions">
+        <button class="btn primary" id="go">Generate</button>
+        <span class="hint" id="aiSummary"></span>
+      </div>
+    </div>
+    <div class="card" id="jobCard">
+      <h2>Progress</h2>
+      <p class="sub" id="jobSub">No run yet. Runs queue one at a time on the GPU.</p>
+      <div class="progress"><i id="bar" style="width:0%"></i></div>
+      <div class="row" style="align-items:center"><span id="stage" class="hint"></span>
+        <span style="flex:0 0 auto"><button class="btn danger" id="cancel" hidden>Cancel</button></span></div>
+      <pre class="log" id="log"></pre>
+    </div>
+  </div>
+  <div class="card" id="result" hidden style="margin-top:16px"></div>
+  <div class="card" style="margin-top:16px"><h2>Queue</h2><div id="queue" class="hint">Empty.</div></div>
+</section>
+
+<!-- ============================== Models -->
+<section class="tab" id="tab-models">
+  <div class="card" style="margin-bottom:16px">
+    <h2>Quick setups</h2>
+    <p class="sub">Fills the planner and vision models below. Review, then <b>Save settings</b> (or just generate: runs use what is on screen).</p>
+    <div class="actions">
+      <button class="btn" data-preset="lmstudio">All local: LM Studio</button>
+      <button class="btn" data-preset="ollama">All local: Ollama</button>
+      <button class="btn" data-preset="deepseek">DeepSeek planner + local vision</button>
+      <button class="btn" data-preset="offline">No AI models (offline)</button>
+    </div>
+    <p class="hint" style="margin-top:10px">LM Studio: start its server (Developer tab → Start server, port 1234) and turn on “Just-in-time model loading”. Use a text model for the planner and a vision model (VLM, e.g. Qwen2.5-VL 7B) for the auditor. On a 24 GB card keep the vision model ≤ 8B so it fits next to SDXL and TripoSR; the pipeline asks LM Studio to unload JIT-loaded models after 30 s idle.</p>
+  </div>
+  <div class="grid">
+    <div class="card" id="card-llm"></div>
+    <div class="card" id="card-vision"></div>
+  </div>
+  <div class="grid" style="margin-top:16px">
+    <div class="card">
+      <h2>Image generation (Stage 1, GPU)</h2>
+      <p class="sub">Reference images from the prompt. Skipped when you give your own image.</p>
+      <label for="diffModel">Model</label>
+      <select id="diffModel">
+        <option value="stabilityai/stable-diffusion-xl-base-1.0|sdxl|30|6.0|1024">SDXL base 1.0 (best, ~10 GB VRAM)</option>
+        <option value="stabilityai/sdxl-turbo|sdxl|4|0.0|1024">SDXL Turbo (fast, 4 steps)</option>
+        <option value="black-forest-labs/FLUX.1-schnell|flux|4|0.0|1024">FLUX.1 schnell (sharp, needs ~16-24 GB)</option>
+        <option value="stabilityai/sd-turbo|sd|1|0.0|512">SD Turbo (tiny, CPU-friendly)</option>
+        <option value="custom">Custom (set in All settings → diffusion)</option>
+      </select>
+      <label class="check"><input type="checkbox" id="comfy"> Use a running ComfyUI instead of diffusers</label>
+      <label class="check"><input type="checkbox" id="offload"> CPU offload (cards under 12 GB)</label>
+    </div>
+    <div class="card">
+      <h2>Image → 3D (Stage 2, GPU)</h2>
+      <p class="sub">Builds the raw mesh from the reference image.</p>
+      <label for="recon">Backend</label>
+      <select id="recon"><option value="triposr">TripoSR (default, in-process)</option><option value="instantmesh">InstantMesh (own venv)</option><option value="openlrm">OpenLRM (own venv)</option><option value="command">Command (TRELLIS, Hunyuan3D, …)</option><option value="primitive">Placeholder box (no GPU)</option></select>
+      <div class="row">
+        <div><label for="device">Device</label><select id="device"><option>cuda:0</option><option>cuda:1</option><option>cpu</option></select></div>
+        <div><label for="mcres">Mesh detail (marching cubes)</label><select id="mcres"><option>192</option><option selected>256</option><option>320</option><option>384</option></select></div>
+      </div>
+      <label class="check"><input type="checkbox" id="unload"> Unload each model before the next stage (recommended on 24 GB)</label>
+    </div>
+  </div>
+  <div class="actions"><button class="btn primary" data-save>Save settings</button><span class="hint" data-savepath></span></div>
+</section>
+
+<!-- ============================== Settings -->
+<section class="tab" id="tab-settings">
+  <div class="card" style="margin-bottom:12px">
+    <div class="row" style="align-items:end">
+      <div style="flex:3 1 260px"><label for="filter">Find a setting</label><input type="text" id="filter" placeholder="e.g. remesh, resolution, approval"></div>
+      <div style="flex:0 0 auto" class="actions"><button class="btn primary" data-save>Save settings</button><button class="btn" id="reload">Reload from file</button></div>
+    </div>
+    <p class="hint" data-savepath style="margin:8px 0 0"></p>
+  </div>
+  <div id="settings"></div>
+</section>
+
+<!-- ============================== Runs -->
+<section class="tab" id="tab-runs">
+  <div class="actions" style="margin-top:0;margin-bottom:12px"><button class="btn" id="refreshRuns">Refresh</button><span class="hint" id="runsDir"></span></div>
+  <div class="runs" id="runs"></div>
+  <div class="card" id="runDetail" hidden style="margin-top:16px"></div>
+</section>
+
+<!-- ============================== System -->
+<section class="tab" id="tab-system">
+  <div class="grid">
+    <div class="card"><h2>GPU</h2><div id="gpus" class="hint">…</div></div>
+    <div class="card"><h2>Software</h2><table class="kv" id="sw"></table></div>
+    <div class="card"><h2>API keys</h2>
+      <p class="sub">Keys typed here stay in the UI's memory for this session and reach runs as environment variables. They are never saved. ✓ = set in your environment.</p>
+      <div id="keys"></div>
+      <div class="actions"><button class="btn" id="saveKeys">Use for this session</button></div>
+    </div>
+  </div>
+  <div class="card" style="margin-top:16px"><h2>Doctor</h2><p class="sub">Checks CUDA, packages, TripoSR, Blender and both AI endpoints with the settings on screen.</p>
+    <div class="actions" style="margin-top:0"><button class="btn primary" id="doctor">Run checks</button></div>
+    <pre class="log" id="doctorOut" style="height:auto;max-height:420px" hidden></pre></div>
+</section>
+</main>
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = (s, el = document) => el.querySelector(s);
+const $$ = (s, el = document) => [...el.querySelectorAll(s)];
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+const state = { schema: [], values: {}, saved: {}, image: null, job: null, since: 0, presets: {}, keyEnvs: [] };
+
+async function api(path, body) {
+  const opt = body === undefined ? {} : { method: "POST", headers: { "Content-Type": "application/json", "X-Asset-UI": "1" }, body: JSON.stringify(body) };
+  const r = await fetch(path, opt);
+  const data = await r.json().catch(() => ({ error: r.statusText }));
+  if (!r.ok) throw new Error(data.error || r.statusText);
+  return data;
+}
+function toast(msg) { const t = $("#toast"); t.textContent = msg; t.classList.add("on"); clearTimeout(t._h); t._h = setTimeout(() => t.classList.remove("on"), 3200); }
+const fileUrl = (rel, dl) => `/files?p=${encodeURIComponent(rel)}${dl ? "&dl=1" : ""}`;
+const get = (sec, key) => state.values[sec]?.[key];
+function set(sec, key, val) { state.values[sec][key] = val; const el = $(`[data-field="${sec}.${key}"]`); if (el) writeField(el, val); markChanged(); }
+
+// ------------------------------------------------------------------ tabs
+$$("#nav button").forEach(b => b.onclick = () => {
+  $$("#nav button").forEach(x => x.classList.toggle("on", x === b));
+  $$("section.tab").forEach(s => s.classList.toggle("on", s.id === "tab-" + b.dataset.tab));
+  if (b.dataset.tab === "runs") loadRuns();
+  if (b.dataset.tab === "system") loadSystem(true);
+});
+
+// ------------------------------------------------------------------ settings
+async function loadState() {
+  const s = await api("/api/state");
+  state.schema = s.schema; state.presets = s.presets; state.keyEnvs = s.key_envs;
+  state.values = {}; state.saved = {};
+  for (const sec of s.schema) { state.values[sec.name] = {}; for (const f of sec.fields) state.values[sec.name][f.key] = f.value; }
+  state.saved = JSON.parse(JSON.stringify(state.values));
+  $$("[data-savepath]").forEach(e => e.textContent = "Settings file: " + s.config_path);
+  $("#runsDir").textContent = "Runs in " + s.output_dir;
+  renderSettings(); renderModelCards(); syncQuick(); renderKeys(s.session_keys);
+}
+function fieldInput(sec, f) {
+  const id = `f-${sec}-${f.key}`, name = `${sec}.${f.key}`;
+  if (f.type === "bool") return `<label class="check"><input type="checkbox" id="${id}" data-field="${name}"> ${esc(f.key)}</label>`;
+  let input;
+  if (f.options) {
+    const opts = [...new Set([...f.options, String(f.value)])];
+    input = `<select id="${id}" data-field="${name}">${opts.map(o => `<option>${esc(o)}</option>`).join("")}</select>`;
+  } else if (f.type === "int" || f.type === "float") {
+    input = `<input type="number" id="${id}" data-field="${name}" step="${f.type === "int" ? 1 : "any"}">`;
+  } else {
+    input = `<input type="text" id="${id}" data-field="${name}" ${f.type === "list" ? 'placeholder="[a, b]"' : ""}>`;
+  }
+  return `<label for="${id}">${esc(f.key)}</label>${input}`;
+}
+function renderSettings() {
+  $("#settings").innerHTML = state.schema.map(sec => `
+    <details class="settings-sec" data-sec="${sec.name}"><summary>${esc(sec.name)} <small>${esc(sec.doc)}</small></summary>
+    <div class="fields">${sec.fields.map(f => `<div class="field" data-key="${sec.name}.${f.key}" data-search="${esc((sec.name + " " + f.key + " " + f.help).toLowerCase())}">
+      ${fieldInput(sec.name, f)}<div class="help">${esc(f.help)}${f.help ? " · " : ""}default: ${esc(JSON.stringify(f.default))}</div></div>`).join("")}</div></details>`).join("");
+  for (const el of $$("[data-field]", $("#settings"))) {
+    const [sec, key] = el.dataset.field.split(".");
+    writeField(el, state.values[sec][key]);
+    el.addEventListener("input", () => { state.values[sec][key] = readField(el, sec, key); markChanged(); syncQuick(); });
+    el.addEventListener("change", () => { state.values[sec][key] = readField(el, sec, key); markChanged(); syncQuick(); });
+  }
+  markChanged();
+}
+function fieldType(sec, key) { return state.schema.find(s => s.name === sec).fields.find(f => f.key === key).type; }
+function writeField(el, v) {
+  if (el.type === "checkbox") el.checked = !!v;
+  else if (Array.isArray(v)) el.value = JSON.stringify(v);
+  else el.value = v ?? "";
+}
+function readField(el, sec, key) {
+  const t = fieldType(sec, key);
+  if (t === "bool") return el.checked;
+  if (t === "int") return parseInt(el.value || "0", 10);
+  if (t === "float") return parseFloat(el.value || "0");
+  if (t === "list") { try { return JSON.parse(el.value); } catch { return el.value; } }
+  return el.value;
+}
+function markChanged() {
+  for (const div of $$(".field")) {
+    const [sec, key] = div.dataset.key.split(".");
+    div.classList.toggle("changed", JSON.stringify(state.values[sec][key]) !== JSON.stringify(state.saved[sec][key]));
+  }
+}
+$("#filter").addEventListener("input", e => {
+  const q = e.target.value.trim().toLowerCase();
+  for (const d of $$(".settings-sec")) {
+    let any = false;
+    for (const f of $$(".field", d)) { const hit = !q || f.dataset.search.includes(q); f.hidden = !hit; any ||= hit; }
+    d.hidden = !any; if (q && any) d.open = true;
+  }
+});
+$$("[data-save]").forEach(b => b.onclick = async () => {
+  try { const r = await api("/api/config", { values: state.values }); state.saved = JSON.parse(JSON.stringify(state.values)); markChanged(); toast("Saved " + r.saved); }
+  catch (e) { toast("Not saved: " + e.message); }
+});
+$("#reload").onclick = () => loadState().then(() => toast("Reloaded"));
+
+// ------------------------------------------------------------------ model cards
+const CARD = {
+  llm: ["Planner LLM (Stage 1)", "Turns the prompt into a spec: real-world size, parts, materials. Any text model; 7-14B is plenty."],
+  vision: ["Vision auditor (Stage 6)", "Looks at the renders and requests fixes. Must accept images (a VLM)."],
+};
+function renderModelCards() {
+  for (const sec of ["llm", "vision"]) {
+    const el = $("#card-" + sec);
+    const providers = state.schema.find(s => s.name === sec).fields.find(f => f.key === "provider").options;
+    el.innerHTML = `<h2>${CARD[sec][0]}</h2><p class="sub">${CARD[sec][1]}</p>
+      <div class="row"><div><label>Provider</label><select data-m="provider">${providers.map(p => `<option>${p}</option>`).join("")}</select></div>
+      <div><label>Server URL</label><input type="text" data-m="base_url"></div></div>
+      <label>Model</label><div class="row"><div style="flex:3 1 200px"><input type="text" data-m="model"></div>
+      <div style="flex:0 0 auto"><button class="btn" data-act="list">Find models</button></div></div>
+      <div class="models" data-models hidden></div>
+      <div class="row"><div><label>API key variable</label><input type="text" data-m="api_key_env" placeholder="default for provider"></div>
+      <div><label>Temperature</label><input type="number" step="0.1" min="0" max="2" data-m="temperature"></div></div>
+      <div data-cli hidden><label>Command (provider cli)</label><input type="text" data-m="command" placeholder='claude -p {prompt}'></div>
+      <div class="actions"><button class="btn" data-act="test">Test connection</button><button class="btn" data-act="chat">Test a reply</button></div>
+      <div class="status" data-status></div>`;
+    for (const inp of $$("[data-m]", el)) {
+      const key = inp.dataset.m;
+      writeField(inp, state.values[sec][key]);
+      inp.addEventListener("input", () => { set(sec, key, readField(inp, sec, key)); if (key === "provider") onProvider(sec); });
+      inp.addEventListener("change", () => { set(sec, key, readField(inp, sec, key)); if (key === "provider") onProvider(sec); });
+    }
+    $('[data-act="list"]', el).onclick = () => findModels(sec);
+    $('[data-act="test"]', el).onclick = () => testModel(sec, false);
+    $('[data-act="chat"]', el).onclick = () => testModel(sec, true);
+    onProvider(sec, true);
+  }
+}
+const DEFAULT_URL = { ollama: "http://localhost:11434", lmstudio: "http://localhost:1234/v1", vllm: "http://localhost:8000/v1", openai_compatible: "http://localhost:8000/v1" };
+function onProvider(sec, initial) {
+  const el = $("#card-" + sec), p = get(sec, "provider");
+  $("[data-cli]", el).hidden = p !== "cli";
+  if (!initial) {
+    const url = DEFAULT_URL[p] ?? state.presets[p] ?? "";
+    set(sec, "base_url", url); writeField($('[data-m="base_url"]', el), url);
+  }
+}
+async function findModels(sec, pickVision) {
+  const el = $("#card-" + sec), box = $("[data-models]", el), status = $("[data-status]", el);
+  status.textContent = "Asking the server…";
+  try {
+    const keyEnv = get(sec, "api_key_env");
+    const r = await api(`/api/models?provider=${encodeURIComponent(get(sec, "provider"))}&base_url=${encodeURIComponent(get(sec, "base_url"))}&key_env=${encodeURIComponent(keyEnv)}`);
+    const models = r.models || [];
+    status.textContent = r.note || `${models.length} model(s). Click one to use it.` + (sec === "vision" ? " Vision-capable ones are marked." : "");
+    box.hidden = !models.length;
+    box.innerHTML = models.map(m => `<div data-id="${esc(m.id)}"><span>${esc(m.id)}</span><span>${m.vision ? '<span class="pill ok">vision</span>' : m.vision === false ? '<span class="pill">text</span>' : ""} ${m.loaded ? '<span class="pill ok">loaded</span>' : ""} ${m.size_gb ? `<span class="pill">${m.size_gb} GB</span>` : ""}</span></div>`).join("");
+    for (const d of $$("[data-id]", box)) d.onclick = () => { set(sec, "model", d.dataset.id); writeField($('[data-m="model"]', el), d.dataset.id); toast(`${sec}: ${d.dataset.id}`); syncQuick(); };
+    if (pickVision !== undefined && models.length) {
+      const pick = models.find(m => pickVision ? m.vision : m.vision === false) || models.find(m => pickVision ? /vl|vision|llava|minicpm-v|gemma-?3/i.test(m.id) : !/vl|vision|llava|embed/i.test(m.id));
+      if (pick) { set(sec, "model", pick.id); writeField($('[data-m="model"]', el), pick.id); }
+    }
+    return models;
+  } catch (e) { status.textContent = "Could not list models: " + e.message; box.hidden = true; return []; }
+}
+async function testModel(sec, chat) {
+  const status = $("[data-status]", $("#card-" + sec));
+  status.textContent = chat ? "Sending a test message…" : "Connecting…";
+  try {
+    const r = await api("/api/ping", { section: sec, values: state.values[sec], chat });
+    status.innerHTML = (r.reachable ? '<span class="pill ok">reachable</span>' : '<span class="pill bad">not reachable</span>') + ` ${esc(r.base_url)} (${r.seconds}s)` +
+      (r.reply !== undefined ? `\nReply: “${esc(r.reply)}” in ${r.chat_seconds}s` : "") + (r.chat_error ? `\n<span style="color:var(--bad)">${esc(r.chat_error)}</span>` : "");
+  } catch (e) { status.textContent = e.message; }
+}
+$$("[data-preset]").forEach(b => b.onclick = async () => {
+  const p = b.dataset.preset;
+  const apply = (sec, provider, url, model, keyEnv = "") => {
+    set(sec, "provider", provider); set(sec, "base_url", url); set(sec, "model", model); set(sec, "api_key_env", keyEnv);
+    const el = $("#card-" + sec); for (const k of ["provider", "base_url", "model", "api_key_env"]) writeField($(`[data-m="${k}"]`, el), get(sec, k)); onProvider(sec, true);
+  };
+  if (p === "lmstudio") {
+    apply("llm", "lmstudio", "http://localhost:1234/v1", get("llm", "model")); apply("vision", "lmstudio", "http://localhost:1234/v1", get("vision", "model"));
+    $("#offline").checked = false;
+    const found = await findModels("llm", false); await findModels("vision", true);
+    toast(found.length ? "LM Studio models picked: check them below" : "LM Studio server not reachable on port 1234");
+  } else if (p === "ollama") {
+    apply("llm", "ollama", "http://localhost:11434", "qwen2.5:14b-instruct"); apply("vision", "ollama", "http://localhost:11434", "qwen2.5vl:7b");
+    $("#offline").checked = false; toast("Ollama: qwen2.5 14B planner + qwen2.5vl 7B vision");
+  } else if (p === "deepseek") {
+    apply("llm", "deepseek", "https://api.deepseek.com", "deepseek-flash", "DEEPSEEK_API_KEY");
+    if (!["lmstudio", "ollama"].includes(get("vision", "provider"))) apply("vision", "lmstudio", "http://localhost:1234/v1", get("vision", "model"));
+    $("#offline").checked = false; toast("DeepSeek planner: add DEEPSEEK_API_KEY under System → API keys");
+  } else { $("#offline").checked = true; toast("Offline: knowledge-base planning, metrics-only audit"); }
+  syncQuick();
+});
+
+// quick controls on the Models / Generate tabs mirror individual settings
+const QUICK = [
+  ["#recon", "reconstruction", "backend"], ["#device", "reconstruction", "device"], ["#mcres", "reconstruction", "mc_resolution", "int"],
+  ["#unload", "pipeline", "unload_models_between_stages"], ["#offload", "diffusion", "enable_cpu_offload"],
+  ["#iters", "pipeline", "max_iterations", "int"], ["#shape", "shapes", "mode"], ["#texres", "texture", "resolution", "int"],
+];
+function syncQuick() {
+  for (const [sel, sec, key] of QUICK) {
+    const el = $(sel), v = state.values[sec][key];
+    if (el.tagName === "SELECT" && ![...el.options].some(o => o.value === String(v))) el.add(new Option(String(v), String(v)));
+    writeField(el, v);
+  }
+  $("#comfy").checked = get("diffusion", "backend") === "comfyui";
+  const dm = $("#diffModel"), cur = get("diffusion", "model_id");
+  const opt = [...dm.options].find(o => o.value.split("|")[0] === cur); dm.value = opt ? opt.value : "custom";
+  const ai = $("#offline").checked ? "offline (no AI calls)" : `planner ${get("llm", "provider")}:${get("llm", "model")} · vision ${get("vision", "provider")}:${get("vision", "model")}`;
+  $("#aiSummary").textContent = ai;
+}
+for (const [sel, sec, key, t] of QUICK) $(sel).addEventListener("change", e => { const el = e.target; set(sec, key, el.type === "checkbox" ? el.checked : t === "int" ? parseInt(el.value, 10) : el.value); });
+$("#comfy").onchange = e => set("diffusion", "backend", e.target.checked ? "comfyui" : "diffusers");
+$("#diffModel").onchange = e => {
+  if (e.target.value === "custom") return;
+  const [id, type, steps, cfg, size] = e.target.value.split("|");
+  set("diffusion", "model_id", id); set("diffusion", "pipeline_type", type); set("diffusion", "steps", +steps);
+  set("diffusion", "guidance_scale", +cfg); set("diffusion", "width", +size); set("diffusion", "height", +size);
+};
+$("#offline").onchange = syncQuick;
+$("#rig").onchange = e => $("#rigOpts").hidden = !e.target.checked;
+
+// ------------------------------------------------------------------ image input
+const drop = $("#drop"), fileInput = $("#file");
+drop.onclick = () => fileInput.click();
+drop.ondragover = e => { e.preventDefault(); drop.style.borderColor = "var(--accent)"; };
+drop.ondragleave = () => drop.style.borderColor = "";
+drop.ondrop = e => { e.preventDefault(); drop.style.borderColor = ""; if (e.dataTransfer.files[0]) takeFile(e.dataTransfer.files[0]); };
+fileInput.onchange = () => fileInput.files[0] && takeFile(fileInput.files[0]);
+function takeFile(f) {
+  const reader = new FileReader();
+  reader.onload = async () => {
+    try {
+      const r = await api("/api/upload", { name: f.name, data: reader.result });
+      state.image = r.path;
+      drop.innerHTML = `<img src="${reader.result}" alt=""><span>${esc(f.name)} · <a href="#" id="clearImg">remove</a></span>`;
+      $("#clearImg").onclick = ev => { ev.preventDefault(); ev.stopPropagation(); state.image = null; drop.innerHTML = '<span>Click or drop an image</span>'; };
+    } catch (e) { toast("Upload failed: " + e.message); }
+  };
+  reader.readAsDataURL(f);
+}
+
+// ------------------------------------------------------------------ jobs
+$("#go").onclick = async () => {
+  const options = {
+    prompt: $("#prompt").value, image_input: state.image, target_format: $("#fmt").value,
+    enable_rigging: $("#rig").checked, rig_method: $("#rigMethod").value, print_clearance_mm: +$("#clearance").value || 0,
+    offline: $("#offline").checked, dry_run: $("#dry").checked,
+  };
+  try { const job = await api("/api/jobs", { values: state.values, options }); watch(job.id); toast("Queued"); }
+  catch (e) { toast(e.message); }
+};
+async function watch(id) {
+  state.job = id; state.since = 0; $("#log").textContent = ""; $("#result").hidden = true; poll();
+}
+async function poll() {
+  const id = state.job; if (!id) return;
+  try {
+    const j = await api(`/api/jobs/${id}?since=${state.since}`);
+    if (id !== state.job) return;
+    if (j.log.length) { const log = $("#log"), atEnd = log.scrollTop + log.clientHeight >= log.scrollHeight - 30; log.textContent += j.log.join("\n") + "\n"; if (atEnd) log.scrollTop = log.scrollHeight; }
+    state.since = j.lines;
+    $("#bar").style.width = Math.round(100 * (j.progress || 0)) + "%";
+    $("#stage").textContent = j.stage || "";
+    $("#jobSub").innerHTML = `${esc(j.options.prompt || j.options.image_input || j.options.resume || "")} · <span class="pill ${j.status === "done" ? "ok" : j.status === "error" ? "bad" : ""}">${j.status}</span>`;
+    $("#cancel").hidden = !["queued", "running"].includes(j.status);
+    $("#cancel").onclick = () => api(`/api/jobs/${id}/cancel`, {}).then(() => toast("Cancelling…"));
+    if (["done", "error", "cancelled"].includes(j.status)) { loadQueue(); if (j.run_dir) showResult(j); return; }
+  } catch (e) { $("#stage").textContent = e.message; }
+  setTimeout(poll, 1200);
+}
+async function showResult(j) {
+  const name = j.run_dir.split(/[\\/]/).filter(Boolean).pop();
+  try { const d = await api("/api/runs/" + encodeURIComponent(name)); renderRun($("#result"), d); $("#result").hidden = false; } catch { }
+}
+async function loadQueue() {
+  const jobs = await api("/api/jobs");
+  $("#queue").innerHTML = jobs.length ? jobs.map(j => `<div class="row" style="align-items:center;padding:4px 0;border-bottom:1px solid var(--line)">
+     <span style="flex:3 1 200px">${esc(j.options.prompt || j.options.image_input || j.options.resume)}</span>
+     <span class="pill ${j.status === "done" ? "ok" : j.status === "error" ? "bad" : ""}" style="flex:0 0 auto">${j.status}</span>
+     <span style="flex:0 0 auto"><button class="btn" data-watch="${j.id}">View</button></span></div>`).join("") : "Empty.";
+  $$("[data-watch]").forEach(b => b.onclick = () => watch(b.dataset.watch));
+}
+
+// ------------------------------------------------------------------ runs
+async function loadRuns() {
+  const runs = await api("/api/runs");
+  $("#runs").innerHTML = runs.length ? runs.map(r => `<div class="card run" data-run="${esc(r.name)}">
+    ${r.preview ? `<img loading="lazy" src="${fileUrl(r.preview)}" alt="">` : '<div style="aspect-ratio:1;background:var(--panel-2)"></div>'}
+    <div class="meta"><b title="${esc(r.prompt)}">${esc(r.prompt || r.name)}</b>
+    ${r.approved ? '<span class="pill ok">approved</span>' : r.approved === false ? '<span class="pill warn">not approved</span>' : '<span class="pill">unfinished</span>'}
+    ${r.score != null ? `<span class="pill">score ${r.score}</span>` : ""} <span class="pill">${esc(r.category || "")}</span></div></div>`).join("") : '<p class="hint">No runs yet.</p>';
+  $$("[data-run]").forEach(c => c.onclick = async () => { const d = await api("/api/runs/" + encodeURIComponent(c.dataset.run)); renderRun($("#runDetail"), d, true); $("#runDetail").hidden = false; $("#runDetail").scrollIntoView({ behavior: "smooth" }); });
+}
+function renderRun(el, d, withResume) {
+  const last = d.iterations[d.iterations.length - 1] || {};
+  const spec = d.spec || {};
+  const verdict = d.export?.approved ? '<span class="pill ok">approved</span>' : last.unverified ? '<span class="pill warn">unverified</span>' : '<span class="pill warn">not approved</span>';
+  el.innerHTML = `<h2>${esc(spec.name || d.name)} ${verdict} ${d.export?.score != null ? `<span class="pill">score ${d.export.score}</span>` : ""}</h2>
+    <p class="sub">${esc(spec.category || "")} · ${[spec.length_m, spec.width_m, spec.height_m].map(v => v != null ? (+v).toFixed(2) : "?").join(" × ")} m · ${d.iterations.length} round(s) · ${esc(d.dir)}</p>
+    <div class="grid"><div>${d.glb ? `<model-viewer src="${fileUrl(d.glb)}" camera-controls auto-rotate shadow-intensity="0.8" exposure="1"></model-viewer>` : '<p class="hint">No GLB to preview (FBX/OBJ open in Blender or your engine).</p>'}
+      <h3>Downloads</h3>${d.files.map(f => `<div><a href="${fileUrl(f.path, true)}">${esc(f.name)}</a> <span class="hint">${(f.bytes / 1e6).toFixed(2)} MB</span></div>`).join("") || '<p class="hint">Not exported yet.</p>'}
+      ${withResume ? `<div class="actions"><select id="resFmt" style="width:auto"><option>glb</option><option>fbx</option><option>obj</option></select><button class="btn" id="resumeBtn">Resume / re-export</button></div>` : ""}</div>
+    <div>${d.iterations.map(it => `<h3>Round ${it.iteration}: ${it.approved ? '<span class="pill ok">approved</span>' : '<span class="pill warn">rejected</span>'} score ${it.score}</h3>
+      ${it.template ? `<div class="hint">Shape: ${esc(it.template.used ? it.template.source : "scan mesh")}${it.template.fit_error != null ? ` (fit ${it.template.fit_error})` : ""}${it.template.skyline ? ` · ${it.template.skyline.towers} towers, ${it.template.skyline.wall_blocks} wall blocks` : ""}</div>` : ""}
+      ${it.blocking?.length ? `<ul class="issues">${it.blocking.map(b => `<li>${esc(b)}</li>`).join("")}</ul>` : ""}
+      ${it.fixes?.length ? `<div class="hint">Fixes fed back: ${esc(it.fixes.join("; "))}</div>` : ""}
+      <div class="thumbs">${it.renders.map(r => `<a href="${fileUrl(r)}" target="_blank"><img loading="lazy" src="${fileUrl(r)}" alt=""><span>${esc(r.split("/").pop().replace(".png", ""))}</span></a>`).join("")}</div>`).join("")}</div></div>`;
+  const rb = $("#resumeBtn", el);
+  if (rb) rb.onclick = async () => {
+    try { const job = await api("/api/jobs", { values: state.values, options: { resume: d.dir, target_format: $("#resFmt", el).value, offline: $("#offline").checked } }); $('#nav [data-tab="generate"]').click(); watch(job.id); }
+    catch (e) { toast(e.message); }
+  };
+}
+$("#refreshRuns").onclick = loadRuns;
+
+// ------------------------------------------------------------------ system
+let sysTimer;
+async function loadSystem(full) {
+  try {
+    const s = await api("/api/system");
+    const g = s.gpus[0];
+    $("#gpuMini").innerHTML = g ? `${esc(g.name)} <span class="meter"><i style="width:${(100 * g.used_mb / g.total_mb).toFixed(0)}%"></i></span> ${(g.used_mb / 1024).toFixed(1)} / ${(g.total_mb / 1024).toFixed(0)} GB · ${g.util}%` : "No NVIDIA GPU found (CPU mode)";
+    if (!full) return;
+    $("#gpus").innerHTML = s.gpus.length ? s.gpus.map(g => `<p><b>${esc(g.name)}</b> · driver ${esc(g.driver)} · ${g.temp_c} °C</p>
+      <div class="progress"><i style="width:${(100 * g.used_mb / g.total_mb).toFixed(0)}%"></i></div>
+      <p class="hint">${(g.used_mb / 1024).toFixed(1)} of ${(g.total_mb / 1024).toFixed(1)} GB VRAM in use · ${g.util}% busy. ${g.total_mb >= 22000 ? "24 GB: SDXL + TripoSR + a 7B vision model fit when models unload between stages." : g.total_mb >= 11000 ? "12-16 GB: use SDXL Turbo or CPU offload, and a 7B vision model." : "Under 12 GB: CPU offload, SD Turbo, and a small or cloud vision model."}</p>`).join("") : '<p class="hint">nvidia-smi not found. Everything still runs on CPU, much slower.</p>';
+    const t = s.torch || {};
+    const rows = [["PyTorch", t.torch ? `${t.torch} · CUDA ${t.cuda ?? "none"} · ${t.available ? "GPU available" : "CPU only"}` : "not installed"],
+      ["Blender", s.blender || `<span style="color:var(--bad)">${esc(s.blender_error || "not found")}</span>`], ["Python", s.python + " · " + s.platform],
+      ...Object.entries(s.servers).map(([k, v]) => [k, v ? '<span class="pill ok">running</span>' : '<span class="pill">not running</span>'])];
+    $("#sw").innerHTML = rows.map(([k, v]) => `<tr><td>${k}</td><td>${typeof v === "string" && v.startsWith("<") ? v : esc(v)}</td></tr>`).join("");
+    state.envKeys = s.keys; renderKeys();
+  } catch (e) { $("#gpuMini").textContent = "System info unavailable"; }
+}
+function renderKeys(session) {
+  if (session) state.sessionKeys = session;
+  $("#keys").innerHTML = state.keyEnvs.map(k => `<label>${k} ${state.envKeys?.[k] ? '<span class="pill ok">✓ in environment</span>' : ""} ${state.sessionKeys?.includes(k) ? '<span class="pill ok">set for this session</span>' : ""}</label>
+     <input type="password" autocomplete="off" data-key="${k}" placeholder="${state.envKeys?.[k] ? "leave empty to use the environment" : "paste key"}">`).join("");
+}
+$("#saveKeys").onclick = async () => {
+  const keys = {}; for (const i of $$("[data-key]")) if (i.value) keys[i.dataset.key] = i.value;
+  const r = await api("/api/keys", { keys }); renderKeys(r.session_keys); toast("Keys kept in memory for this session");
+};
+$("#doctor").onclick = async () => {
+  const out = $("#doctorOut"); out.hidden = false; out.textContent = "Running checks (first run can take a minute)…";
+  try { const r = await api("/api/doctor", { values: state.values }); out.textContent = r.output; } catch (e) { out.textContent = e.message; }
+};
+
+loadState().then(loadQueue).catch(e => toast("Could not load settings: " + e.message));
+loadSystem(false); sysTimer = setInterval(() => loadSystem($("#tab-system").classList.contains("on")), 4000);
+</script>
+</body>
+</html>

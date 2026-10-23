@@ -77,6 +77,9 @@ shapes:                      # Stage 3b primitive templates
   blueprint: true            # guns/tools/machinery: three-view silhouette hull
   blueprint_max_error: 0.05
   blueprint_resolution: 256
+  skyline_max_error: 0.1     # castles/cathedrals/...: towers, walls and roofs read from the scan's roofline
+  skyline_grid: 64
+  battlements: true          # merlons on flat tower tops and wall tops
 
 texture:                     # Stage 4
   resolution: 2048           # 1024 | 2048 | 4096
@@ -85,6 +88,7 @@ texture:                     # Stage 4
   project_reference: true    # re-project the reconstruction's input image onto visible texels
   min_projection_iou: 0.7
   mirror_fill: true          # fill unseen faces from the mirrored view (per-category symmetry)
+  unseen_fill: tiles         # templates: tiles (per-material texture from the reference / procedural) | bake
   cage_extrusion: 0.01
   bake_samples: 16
 
