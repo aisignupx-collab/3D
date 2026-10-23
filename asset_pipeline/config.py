@@ -252,8 +252,19 @@ def _apply_env(cfg: Config) -> None:
 
 
 def find_blender(explicit: str = "") -> Optional[str]:
-    """Locate a Blender executable (explicit > $BLENDER_PATH > PATH > common installs)."""
-    candidates = [explicit, os.environ.get("BLENDER_PATH", "")]
+    """Locate a Blender executable (explicit > $BLENDER_PATH > PATH > common installs).
+
+    A path given explicitly (argument or $BLENDER_PATH) must exist: falling back to
+    another install would silently run a different Blender than the one asked for.
+    """
+    given = [(source, value) for source, value in (("blender.executable / --blender_path", explicit),
+                                                   ("BLENDER_PATH", os.environ.get("BLENDER_PATH", ""))) if value]
+    for source, value in given:
+        if not Path(value).is_file():
+            raise FileNotFoundError(f"Blender not found at {value!r} (from {source})")
+    if given:
+        return str(Path(given[0][1]))
+    candidates = []
     which = shutil.which("blender")
     if which:
         candidates.append(which)

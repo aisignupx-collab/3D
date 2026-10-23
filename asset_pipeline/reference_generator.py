@@ -21,6 +21,7 @@ import gc
 import io
 import json
 import logging
+import os
 import random
 import time
 import uuid
@@ -52,6 +53,36 @@ class ReferenceSet:
 # Preprocessing
 # ---------------------------------------------------------------------------
 
+_DLL_HANDLES: List[Any] = []
+
+
+def _register_gpu_dlls():
+    """Make cuDNN/cuBLAS findable for onnxruntime-gpu (rembg) on Windows.
+
+    onnxruntime-gpu needs cuDNN 9, which ships inside ``torch/lib``. Importing torch
+    registers that directory; without it ``--image_input`` (which reaches rembg
+    before anything imports torch) fails with ``cudnn64_9.dll ... error 3``.
+    """
+    if os.name != "nt" or _DLL_HANDLES:
+        return
+    try:
+        import torch
+
+        lib = str(Path(torch.__file__).parent / "lib")
+        _DLL_HANDLES.append(os.add_dll_directory(lib))  # the handle must stay alive
+        # onnxruntime loads cuDNN by name through the normal search order, which only PATH covers
+        os.environ["PATH"] = lib + os.pathsep + os.environ.get("PATH", "")
+    except (ImportError, OSError):
+        pass
+    try:
+        import onnxruntime
+
+        if hasattr(onnxruntime, "preload_dlls"):  # onnxruntime >= 1.21
+            onnxruntime.preload_dlls()
+    except Exception as exc:  # noqa: BLE001 - CPU fallback still works
+        log.debug("onnxruntime.preload_dlls failed: %s", exc)
+
+
 class ImagePreprocessor:
     def __init__(self, cfg):
         self.cfg = cfg
@@ -59,6 +90,7 @@ class ImagePreprocessor:
 
     def _rembg_session(self):
         if self._session is None:
+            _register_gpu_dlls()
             try:
                 from rembg import new_session
             except ImportError as exc:

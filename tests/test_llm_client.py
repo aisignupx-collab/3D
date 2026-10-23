@@ -164,3 +164,13 @@ def test_cli_provider(tmp_path, image):
     assert echo.chat("hello there").strip() == "hello there"
     with pytest.raises(ValueError):
         LLMClient("cli", "")
+
+
+def test_cli_command_split_keeps_windows_paths(monkeypatch):
+    import asset_pipeline.llm_client as llm_client
+
+    with monkeypatch.context() as m:
+        m.setattr(llm_client.os, "name", "nt")
+        parts = llm_client.split_command(r'X:\a\b.exe -p "{prompt}" --dir "C:\Program Files\x"')
+    assert parts == [r"X:\a\b.exe", "-p", "{prompt}", "--dir", r"C:\Program Files\x"]
+    assert llm_client.split_command("claude -p '{prompt}'") == ["claude", "-p", "{prompt}"]

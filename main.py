@@ -60,6 +60,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--doctor", action="store_true", help="check CUDA, models, Blender and LLM endpoints")
     p.add_argument("--log_level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = p.parse_args(argv)
+    if args.prompt is not None and not args.prompt.strip():
+        p.error("--prompt is empty")
     if not args.doctor and not (args.prompt or args.image_input or args.resume):
         p.error("one of --prompt, --image_input or --resume is required")
     return args
@@ -117,7 +119,11 @@ def main(argv=None) -> int:
         logging.error("image not found: %s", args.image_input)
         return 2
 
-    ctx = Pipeline(cfg).run(options)
+    try:
+        ctx = Pipeline(cfg).run(options)
+    except (FileNotFoundError, ValueError) as exc:  # bad paths / input: report, no traceback
+        logging.error("%s", exc)
+        return 2
     summary = {
         "run_dir": str(ctx.run_dir),
         "asset": ctx.export["output"] if ctx.export else None,

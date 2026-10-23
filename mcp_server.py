@@ -136,6 +136,7 @@ def start_asset_job(prompt: str = "", image_path: str = "", target_format: str =
     "done" (result holds the exported file, previews and audit) or "error". Jobs queue and
     run one at a time.
     """
+    prompt, image_path = (prompt or "").strip(), (image_path or "").strip()
     if not prompt and not image_path:
         raise ValueError("give a prompt, an image_path, or both")
     job = {"job_id": uuid.uuid4().hex[:8], "status": "queued", "prompt": prompt, "image_path": image_path,
@@ -175,6 +176,7 @@ def generate_asset(prompt: str = "", image_path: str = "", target_format: str = 
     rigging, and the vision-audited refinement loop. Returns the exported file, previews and
     the final audit. target_format: glb | fbx | obj. shape_mode: auto | primitives | mesh.
     """
+    prompt, image_path = (prompt or "").strip(), (image_path or "").strip()
     if not prompt and not image_path:
         raise ValueError("give a prompt, an image_path, or both")
     options = RunOptions(prompt=prompt or None, image_input=image_path or None, target_format=target_format,

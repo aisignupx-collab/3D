@@ -292,3 +292,32 @@ def test_every_recipe_builds_watertight(runner, raw_mesh, tmp_path):
         open_ = {n: m["boundary_edges"] + m["non_manifold_edges"] for n, m in res["metrics"].items()
                  if not m["watertight"]}
         assert not open_, (key, open_, res.get("rebuilt_as_shells"))
+
+
+def test_resume_continues_instead_of_restarting(tmp_path, monkeypatch):
+    import asset_pipeline.orchestrator as orch
+    from asset_pipeline.config import Config
+
+    cfg = Config()
+    cfg.blender.executable, cfg.blender.use_gpu = BLENDER, False
+    cfg.reconstruction.backend = "primitive"
+    cfg.pipeline.output_dir, cfg.pipeline.max_iterations = str(tmp_path), 1
+    cfg.pipeline.approval_score = 2.0  # never approved, so the loop has somewhere to continue
+    cfg.texture.resolution, cfg.render.resolution, cfg.render.samples = 128, 96, 1
+    monkeypatch.setattr(orch, "apply_fixes", lambda c, t, issues: (dict(c, smooth_iterations=2), t, ["smooth"]))
+    first = orch.Pipeline(cfg).run(orch.RunOptions(prompt="a wooden crate", offline=True, skip_references=True,
+                                                   target_format="glb"))
+    it1 = json.loads(json.dumps(first.iterations[0], default=str))
+    assert it1["next_params"]["cleanup"]["smooth_iterations"] == 2
+
+    cfg.pipeline.max_iterations = 2
+    again = orch.Pipeline(cfg).run(orch.RunOptions(resume=str(first.run_dir), offline=True, target_format="obj"))
+    assert json.loads(json.dumps(again.iterations[0], default=str)) == it1  # kept, not re-run
+    assert [r["iteration"] for r in again.iterations] == [1, 2]
+    assert again.iterations[1]["cleanup_params"]["smooth_iterations"] == 2
+    assert again.export["output"].endswith(".obj")
+    assert list(first.run_dir.glob("manifest.before_resume_*.json"))
+
+    # Nothing left to do: a second resume only re-exports
+    final = orch.Pipeline(cfg).run(orch.RunOptions(resume=str(first.run_dir), offline=True, target_format="fbx"))
+    assert len(final.iterations) == 2 and final.export["output"].endswith(".fbx")

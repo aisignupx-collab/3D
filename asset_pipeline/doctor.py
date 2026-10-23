@@ -67,7 +67,10 @@ def run_doctor(cfg: Config) -> int:
         repo = Path(cfg.reconstruction.openlrm_repo)
         add("OpenLRM repo", OK if (repo / "openlrm").is_dir() else FAIL, str(repo.resolve()))
 
-    exe = find_blender(cfg.blender.executable)
+    try:
+        exe, missing = find_blender(cfg.blender.executable), "not found - set blender.executable or BLENDER_PATH"
+    except FileNotFoundError as exc:
+        exe, missing = None, str(exc)
     if exe:
         try:
             out = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=60).stdout
@@ -77,7 +80,7 @@ def run_doctor(cfg: Config) -> int:
         except (OSError, subprocess.SubprocessError, ValueError, IndexError) as exc:
             add("blender", WARN, f"{exe} ({exc})")
     else:
-        add("blender", FAIL, "not found - set blender.executable or BLENDER_PATH")
+        add("blender", FAIL, missing)
 
     for label, section in (("planner LLM", cfg.llm), ("vision LLM", cfg.vision)):
         try:

@@ -46,3 +46,24 @@ def test_rtx4090_profile_matches_schema():
 
     cfg = load_config(str(Path(__file__).resolve().parents[1] / "configs" / "rtx4090.yaml"))
     assert cfg.texture.resolution == 4096 and cfg.reconstruction.device == "cuda:0"
+
+
+def test_explicit_blender_path_must_exist(tmp_path, monkeypatch):
+    from asset_pipeline.config import find_blender
+
+    fake = tmp_path / "blender.exe"
+    fake.write_text("")
+    monkeypatch.delenv("BLENDER_PATH", raising=False)
+    assert find_blender(str(fake)) == str(fake)
+    with pytest.raises(FileNotFoundError, match="nope"):
+        find_blender(str(tmp_path / "nope" / "blender.exe"))
+    monkeypatch.setenv("BLENDER_PATH", str(tmp_path / "gone.exe"))
+    with pytest.raises(FileNotFoundError, match="BLENDER_PATH"):
+        find_blender(str(fake))
+
+
+def test_empty_prompt_is_rejected():
+    import main
+
+    with pytest.raises(SystemExit):
+        main.parse_args(["--prompt", "   "])

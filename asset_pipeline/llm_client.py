@@ -44,6 +44,14 @@ def _encode_image(path: ImageInput) -> tuple:
     return media_type, base64.b64encode(path.read_bytes()).decode("ascii")
 
 
+def split_command(command: str) -> List[str]:
+    """Split a command line; on Windows keep backslashes (``C:\\tools\\claude.exe``) and strip quotes."""
+    if os.name != "nt":
+        return shlex.split(command)
+    return [part[1:-1] if len(part) > 1 and part[0] == part[-1] and part[0] in "\"'" else part
+            for part in shlex.split(command, posix=False)]
+
+
 def extract_json(text: str) -> Any:
     """Parse the first JSON object/array in an LLM reply.
 
@@ -191,7 +199,7 @@ class LLMClient:
             elif self.provider == "anthropic":
                 return bool(self.api_key)
             elif self.provider == "cli":
-                return shutil.which(shlex.split(self.command)[0]) is not None
+                return shutil.which(split_command(self.command)[0]) is not None
             else:
                 headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
                 r = requests.get(f"{self._openai_root()}/models", headers=headers, timeout=5)
@@ -275,10 +283,10 @@ class LLMClient:
         if images:
             text += "\n\nLook at these image files (in this order):\n" + "\n".join(str(Path(i).resolve()) for i in images)
         if "{prompt}" in self.command:
-            cmd = [part.replace("{prompt}", text) for part in shlex.split(self.command)]
+            cmd = [part.replace("{prompt}", text) for part in split_command(self.command)]
             stdin = None
         else:
-            cmd, stdin = shlex.split(self.command), text
+            cmd, stdin = split_command(self.command), text
         try:
             proc = subprocess.run(cmd, input=stdin, capture_output=True, text=True, timeout=self.timeout_s)
         except (OSError, subprocess.TimeoutExpired) as exc:

@@ -108,6 +108,16 @@ git clone https://github.com/VAST-AI-Research/TripoSR third_party/TripoSR
 pip install scikit-build-core cmake ninja pybind11
 pip install --no-build-isolation git+https://github.com/tatsy/torchmcubes.git
 ```
+On **Windows**, build from a shell with the Visual Studio 2022 C++ toolchain loaded, or CMake can't find
+Ninja/NVCC. With CUDA 13.x, MSVC also needs its conforming preprocessor for CCCL:
+```bat
+call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
+set "CMAKE_GENERATOR=Ninja"
+set "SKBUILD_CMAKE_ARGS=-DCMAKE_CUDA_FLAGS=-Xcompiler=/Zc:preprocessor"
+pip install --no-build-isolation git+https://github.com/tatsy/torchmcubes.git
+python -c "import torchmcubes, torch; print(torch.cuda.is_available())"
+```
+Write `set "NAME=value"` with no spaces around `=`: `set "CMAKE_GENERATOR= Ninja"` silently sets a wrong value.
 Weights (`stabilityai/TripoSR`, ~1.7 GB) download from Hugging Face on first run.
 
 **InstantMesh (optional, own venv):**
@@ -153,7 +163,9 @@ wget https://download.blender.org/release/Blender4.2/blender-4.2.9-linux-x64.tar
 tar xf blender-4.2.9-linux-x64.tar.xz -C /opt && export BLENDER_PATH=/opt/blender-4.2.9-linux-x64/blender
 ```
 The executable is found from (in order) `--blender_path`, `blender.executable` in `config.yaml`,
-`$BLENDER_PATH`, `PATH`, then the default install locations:
+`$BLENDER_PATH`, `PATH`, then the default install locations. A path you give explicitly (the first three)
+must exist: a wrong one stops the run before any GPU work instead of quietly using another Blender.
+Default locations:
 * Windows: `C:\Program Files\Blender Foundation\Blender 4.2\blender.exe`
 * macOS: `/Applications/Blender.app/Contents/MacOS/Blender`
 
@@ -182,6 +194,9 @@ pytest                                       # unit tests; Blender tests run whe
 | `CUDA out of memory` in Stage 1 | `diffusion.enable_cpu_offload: true`, or an SDXL-turbo / FLUX-schnell model. Make sure Ollama isn't holding the vision model on the same GPU (`OLLAMA_KEEP_ALIVE=0`). |
 | Asset lies on its side / faces backwards | Auto-orientation fixes tilts up to `cleanup.max_tilt_correction` (45°) but can't tell which face is the front. For a backend with a different up axis, set `cleanup.import_rotation_deg` (e.g. `[90, 0, 0]`). The audit can also request a `reorient` fix. |
 | Bone heat weighting fails | Happens on non-manifold or self-intersecting meshes. The rig step falls back to proximity weights automatically; `--remesh_mode voxel` gives bone heat a clean manifold. |
+| Windows: `LoadLibrary failed for cudnn64_9.dll with error 3` (rembg / onnxruntime-gpu) | onnxruntime-gpu needs cuDNN 9, which ships in `torch\lib`. The pipeline now registers that folder before loading rembg. On an older checkout, prepend `.venv\Lib\site-packages\torch\lib` to `PATH`. |
+| Stage 3 runs for many minutes on a huge or very dense scan | Remeshing runs at unit scale, so the asset's metric size no longer matters. If quadriflow still exceeds `blender.cleanup_timeout_s` (600 s), Stage 3 is retried with voxel remeshing (`stage3_timeout_fallback` in the manifest). |
+| `cli` LLM provider can't start on Windows | Fixed: commands are split without POSIX escaping on Windows. Quote paths that contain spaces: `"C:\Program Files\tool\agent.exe" -p "{prompt}"`. |
 | Blender crash log in `/tmp/*.crash.txt` | Check `blender_jobs/blender_<op>.log` in the run folder. Every op writes its full log there. |
 
 ---
@@ -201,7 +216,7 @@ pytest                                       # unit tests; Blender tests run whe
 | `--shape_mode auto\|primitives\|mesh` | rebuild from primitive templates when they fit the scan (default) / always / never |
 | `--recon_backend`, `--diffusion_backend` | swap models |
 | `--max_iterations N` | audit/refinement rounds (default 3) |
-| `--resume RUN_DIR` | re-run Stages 3-6 on an existing run (reuses the spec, references and raw mesh) |
+| `--resume RUN_DIR` | continue an existing run: keeps the spec, references, raw mesh and every finished iteration, continues the refinement loop after the last one (raise `--max_iterations` for more rounds), or only re-exports when the loop had finished (e.g. `--target_format obj`). The old manifest is kept as `manifest.before_resume_*.json` |
 | `--offline` | no LLM/VLM calls |
 | `--dry_run` | offline + placeholder mesh + no diffusion: exercises Blender end to end without a GPU |
 | `--doctor` | environment check |
@@ -304,11 +319,11 @@ clean shapes shade cleanly.
 
 | Fix action | Triggered by | Parameter change |
 |---|---|---|
-| `make_manifold` | boundary / non-manifold edges | decimate→voxel remesh, else finer voxels + hole fill |
+| `make_manifold` | boundary / non-manifold edges | switch to voxel remeshing (closed by construction), then finer voxels |
 | `increase_detail` | VLM: blobby, lost features | voxel resolution ×1.3, face budget ×1.5 |
 | `reduce_noise` | VLM: lumpy / stair-stepped | +2 smoothing iterations |
 | `remove_floaters` | small islands | raise minimum island size |
-| `rescale_axis` | extent >25 % off spec, or VLM | per-axis scale (bounded 0.7-1.3) |
+| `rescale_axis` | measured extent >25 % off spec | per-axis scale, cumulative and bounded 0.5-2.0 (larger errors are fixed in Stage 3 by fitting each axis to the spec). VLM proportion remarks are advisory only |
 | `reorient` | VLM: upside down / on its side | extra import rotation |
 | `reduce_faces` | >1.5× face budget | target faces ×0.7 |
 | `reunwrap` | UV area distortion > 0.5, VLM checker stretching | smaller smart-UV angle → lightmap pack |
@@ -316,6 +331,22 @@ clean shapes shade cleanly.
 | `reweight` | pose test > 3% bad edges, unweighted vertices, VLM: tearing at joints | more weight smoothing → proximity weights |
 
 If only texture parameters changed, Stage 3 and the segmentation cut are reused and only Stage 4 onward re-runs.
+
+Every geometry stage also checks its own output. Cleanup, template builds and part cuts run a repair
+pass (merge duplicates, drop duplicate faces and fins, split edges shared by 3+ faces, fill holes) that is
+kept only when it reduces open edges. If the mesh is still open, scans are re-sealed with a voxel shell
+sized to the face budget, and template groups whose boolean union stays open are rebuilt as separately
+cut, closed shells.
+
+**Approval** requires all of the following:
+* a score at or above `pipeline.approval_score`;
+* no high-severity issue, and no medium issue from the measured metrics (scale, holes, floaters,
+  rig stretch, unbaked texels);
+* the vision model approving.
+
+When a vision model is configured but fails (server down, timeout), the iteration is **unverified**, not
+approved. The reasons are listed in the manifest under `audit.blocking`. With `--offline` there is no
+vision model, so the metrics alone decide.
 
 ---
 

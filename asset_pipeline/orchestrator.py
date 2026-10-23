@@ -133,8 +133,14 @@ class Pipeline:
     # ------------------------------------------------------------------- run
 
     def run(self, options: RunOptions) -> RunContext:
+        if options.prompt is not None and not options.prompt.strip():
+            raise ValueError("the prompt is empty")
+        options.prompt = options.prompt.strip() if options.prompt else options.prompt
         if not options.prompt and not options.image_input and not options.resume:
             raise ValueError("provide --prompt, --image_input or --resume")
+        # Fail before the GPU stages, not after them
+        if not find_blender(self.cfg.blender.executable):
+            raise FileNotFoundError("Blender not found - set blender.executable, --blender_path or BLENDER_PATH")
         self._init_clients(options.offline)
         if options.resume:
             ctx = self._load(Path(options.resume), options)
@@ -175,7 +181,12 @@ class Pipeline:
 
             ctx.raw_camera = TripoSRBackend.input_camera()  # runs from before cameras were recorded
         ctx.timings = data.get("timings", {})
-        log.info("Resuming %s (spec=%s, raw_mesh=%s)", run_dir, bool(ctx.spec), ctx.raw_mesh)
+        # Completed iterations are kept; the loop continues after the last one (or only re-exports)
+        ctx.iterations = [r for r in data.get("iterations") or []
+                          if r.get("audit") and Path(r.get("final_blend", "")).is_file()]
+        shutil.copy2(run_dir / "manifest.json", run_dir / f"manifest.before_resume_{time.strftime('%Y%m%d_%H%M%S')}.json")
+        log.info("Resuming %s (spec=%s, raw_mesh=%s, %d completed iterations)", run_dir, bool(ctx.spec),
+                 ctx.raw_mesh, len(ctx.iterations))
         return ctx
 
     # --------------------------------------------------------------- stage 1
@@ -354,9 +365,21 @@ class Pipeline:
         components = self._shape_components(spec)
         rig = {"method": ctx.options.rig_method, "weights": "auto", "weight_smooth": 1, "max_influences": 4,
                "pose_test": True}
-        ctx.iterations = []
+        done = ctx.iterations if ctx.options.resume else []
+        ctx.iterations = list(done)
+        first = 1
+        if done:
+            last = done[-1]
+            finished = (last["audit"]["approved"] or len(done) >= self.cfg.pipeline.max_iterations
+                        or "next_params" not in last)
+            if finished:
+                log.info("Resume: refinement already finished after %d iterations; re-exporting", len(done))
+                return self._best(ctx)
+            cleanup, texture, rig = (last["next_params"][k] for k in ("cleanup", "texture", "rig"))
+            first = last["iteration"] + 1
+            log.info("Resume: continuing at iteration %d", first)
 
-        for it in range(1, max(1, self.cfg.pipeline.max_iterations) + 1):
+        for it in range(first, max(1, self.cfg.pipeline.max_iterations) + 1):
             it_dir = ctx.run_dir / f"iter_{it}"
             it_dir.mkdir(exist_ok=True)
             record: Dict[str, Any] = {"iteration": it, "cleanup_params": cleanup, "texture_params": texture}
@@ -474,9 +497,6 @@ class Pipeline:
             if report.approved:
                 log.info("Approved on iteration %d", it)
                 break
-            if it == self.cfg.pipeline.max_iterations:
-                log.warning("Not approved after %d iterations; exporting best attempt", it)
-                break
             cleanup, texture, changes = apply_fixes(cleanup, texture, report.issues)
             rig, rig_changes = apply_rig_fixes(rig, report.issues)
             changes += rig_changes
@@ -484,8 +504,17 @@ class Pipeline:
             if not changes:
                 log.warning("Audit found no actionable fixes; stopping refinement")
                 break
+            # Saved so --resume (optionally with a higher --max_iterations) can continue from here
+            record["next_params"] = {"cleanup": cleanup, "texture": texture, "rig": rig}
+            ctx.save(self.cfg)
+            if it == self.cfg.pipeline.max_iterations:
+                log.warning("Not approved after %d iterations; exporting best attempt", it)
+                break
             log.info("Feeding back fixes: %s", "; ".join(changes))
+        return self._best(ctx)
 
+    @staticmethod
+    def _best(ctx: RunContext) -> Dict[str, Any]:
         best = max(ctx.iterations, key=lambda r: (r["audit"]["approved"], r["audit"]["score"], r["iteration"]))
         log.info("Selected iteration %d (score %.2f, approved=%s)", best["iteration"],
                  best["audit"]["score"], best["audit"]["approved"])
