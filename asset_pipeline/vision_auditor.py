@@ -468,9 +468,11 @@ def apply_fixes(cleanup: Dict[str, Any], texture: Dict[str, Any],
         if fix in done:
             continue
         if fix == "make_manifold":
-            if c["remesh_mode"] in ("decimate", "none"):
+            # Change strategy first (voxel output is closed by construction), then add resolution
+            if c["remesh_mode"] != "voxel":
+                change(fix, f"remesh_mode {c['remesh_mode']} -> voxel (watertight)")
                 c["remesh_mode"] = "voxel"
-                change(fix, "remesh_mode -> voxel (watertight)")
+                c["fill_holes"] = True
             elif c["voxel_resolution"] < 512:
                 c["voxel_resolution"] = min(512, int(c["voxel_resolution"] * 1.25))
                 c["fill_holes"] = True

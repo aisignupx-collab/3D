@@ -113,6 +113,8 @@ class VisionConfig:
 class BlenderConfig:
     executable: str = ""  # auto-detected when empty
     timeout_s: int = 3600
+    # Stage 3 limit; on timeout the cleanup is retried with voxel remeshing instead of quadriflow
+    cleanup_timeout_s: int = 600
     use_gpu: bool = True  # Cycles GPU baking (CUDA/OptiX)
 
 

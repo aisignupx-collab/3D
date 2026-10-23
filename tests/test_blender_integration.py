@@ -90,6 +90,13 @@ def test_errors_are_reported(runner, tmp_path):
     assert result["status"] == "error"
 
 
+def test_timeout_is_reported(runner, raw_mesh, tmp_path):
+    from asset_pipeline.blender_automation import BlenderTimeout
+
+    with pytest.raises(BlenderTimeout, match="timed out after 1s"):  # Blender start-up alone takes longer
+        runner.run("cleanup", cleanup_params(raw_mesh, tmp_path / "t.blend"), tag="slow", timeout_s=1)
+
+
 def test_tilted_reconstruction_is_uprighted(runner, raw_mesh, tmp_path):
     # Camera-elevation tilt + yaw, as a three-quarter view from above produces
     s3 = runner.run("cleanup", cleanup_params(raw_mesh, tmp_path / "t.blend", import_rotation_deg=[20, -15, 30],
@@ -250,3 +257,38 @@ def test_unbaked_texels_are_filled(runner, raw_mesh, tmp_path):
     # after filling, black is only left outside the UV islands (plus bake margin)
     coverage = sum(m.get("uv_coverage", 0) for m in tex["metrics"].values())
     assert (albedo.max(axis=-1) < 0.015).mean() <= (1 - coverage) + 0.02
+
+
+def _broken_cube(path):
+    """Unit cube with one face missing, one face duplicated and a fin hanging off an edge."""
+    v = [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1), (0.5, -0.8, 1.3)]
+    faces = [(1, 4, 3, 2), (5, 6, 7, 8), (1, 2, 6, 5), (2, 3, 7, 6), (3, 4, 8, 7),  # -X side left open
+             (1, 2, 6, 5), (5, 6, 9)]  # duplicate face, fin on edge 5-6
+    lines = [f"v {x} {y} {z}" for x, y, z in v] + ["f " + " ".join(map(str, f)) for f in faces]
+    path.write_text("\n".join(lines) + "\n")
+    return str(path)
+
+
+@pytest.mark.parametrize("mode", ["none", "decimate", "quadriflow"])
+def test_cleanup_output_is_watertight(runner, tmp_path, mode):
+    s3 = runner.run("cleanup", cleanup_params(_broken_cube(tmp_path / "broken.obj"), tmp_path / "b.blend",
+                                              dimensions=[0.5, 0.5, 0.5], fit_dimension="height", remesh_mode=mode,
+                                              fill_holes=False, fix_intersections=False, min_island_ratio=0.0,
+                                              import_rotation_deg=[0, 0, 0]), tag=f"broken_{mode}")
+    assert s3["repair"]["open_edges_before"] > 0 or mode == "quadriflow"
+    assert s3["metrics"]["watertight"], s3["repair"]
+
+
+def test_every_recipe_builds_watertight(runner, raw_mesh, tmp_path):
+    from asset_pipeline.shape_templates import RECIPES, expand_arrays, recipe_for
+
+    runner.run("cleanup", cleanup_params(raw_mesh, tmp_path / "r3.blend", remesh_mode="voxel"), tag="r_clean")
+    for recipe in RECIPES:
+        key = recipe["keywords"][0]
+        comps = [c.to_dict() for c in expand_arrays(recipe_for(key))]
+        res = runner.run("primitives", dict(input_blend=str(tmp_path / "r3.blend"),
+                                            output_blend=str(tmp_path / "r.blend"), components=comps,
+                                            mode="primitives", materials=[]), tag=f"recipe_{key.replace(' ', '_')}")
+        open_ = {n: m["boundary_edges"] + m["non_manifold_edges"] for n, m in res["metrics"].items()
+                 if not m["watertight"]}
+        assert not open_, (key, open_, res.get("rebuilt_as_shells"))

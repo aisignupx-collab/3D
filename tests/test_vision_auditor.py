@@ -65,6 +65,16 @@ def test_apply_fixes_closed_loop(params):
     assert cleanup["remesh_mode"] == "decimate"  # inputs untouched
 
 
+def test_make_manifold_changes_strategy(params):
+    cleanup, texture = params
+    cleanup.update(remesh_mode="quadriflow", voxel_resolution=192)
+    holes = [Issue("geometry", "high", "holes", "make_manifold")]
+    c, _, changes = apply_fixes(cleanup, texture, holes)
+    assert c["remesh_mode"] == "voxel" and c["voxel_resolution"] == 192 and changes
+    c2, _, _ = apply_fixes(c, texture, holes)  # only once the strategy is voxel does resolution grow
+    assert c2["voxel_resolution"] == 240
+
+
 def test_apply_fixes_exhausts(params):
     cleanup, texture = params
     cleanup.update(min_island_ratio=0.2)

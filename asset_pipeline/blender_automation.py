@@ -51,6 +51,10 @@ class BlenderError(RuntimeError):
     pass
 
 
+class BlenderTimeout(BlenderError):
+    pass
+
+
 class BlenderRunner:
     """Runs operations from this file inside a headless Blender process."""
 
@@ -71,8 +75,9 @@ class BlenderRunner:
         out = subprocess.run([self.executable, "--version"], capture_output=True, text=True, timeout=60)
         return out.stdout.splitlines()[0] if out.stdout else "unknown"
 
-    def run(self, operation: str, params: dict, tag: str = "") -> dict:
+    def run(self, operation: str, params: dict, tag: str = "", timeout_s: int = 0) -> dict:
         tag = tag or operation
+        timeout = timeout_s or self.timeout_s
         job_path = self.work_dir / f"job_{tag}.json"
         result_path = self.work_dir / f"result_{tag}.json"
         log_path = self.work_dir / f"blender_{tag}.log"
@@ -84,9 +89,9 @@ class BlenderRunner:
         start = time.time()
         with log_path.open("w", encoding="utf-8") as log_fh:
             try:
-                proc = subprocess.run(cmd, stdout=log_fh, stderr=subprocess.STDOUT, timeout=self.timeout_s)
-            except subprocess.TimeoutExpired as exc:
-                raise BlenderError(f"Blender '{operation}' timed out after {self.timeout_s}s (log: {log_path})") from exc
+                proc = subprocess.run(cmd, stdout=log_fh, stderr=subprocess.STDOUT, timeout=timeout)
+            except subprocess.TimeoutExpired as exc:  # subprocess.run kills Blender before raising
+                raise BlenderTimeout(f"Blender '{operation}' timed out after {timeout}s (log: {log_path})") from exc
         tail = "\n".join(log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-40:])
         if not result_path.is_file():
             raise BlenderError(f"Blender '{operation}' exited {proc.returncode} without a result.\n{tail}")
@@ -408,6 +413,105 @@ def bm_cleanup(obj, merge_dist: float, min_island_ratio: float, fill_holes: bool
     me.update()
     log(f"cleanup: {before} -> {len(me.polygons)} faces, removed {removed} floaters, filled {filled} holes")
     return {"floaters_removed": removed, "holes_filled": filled}
+
+
+def open_edges(obj) -> int:
+    """Boundary + non-manifold edges (what keeps a mesh from being watertight)."""
+    bm = bmesh.new()
+    bm.from_mesh(obj.data)
+    n = sum(1 for e in bm.edges if not e.is_manifold)
+    bm.free()
+    return n
+
+
+def _count_open(bm) -> int:
+    return sum(1 for e in bm.edges if not e.is_manifold)
+
+
+def _repair_pass(bm, tol: float, aggressive: bool):
+    if not aggressive:
+        bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=tol)
+        bmesh.ops.dissolve_degenerate(bm, edges=bm.edges, dist=tol)
+        seen, dupes = set(), []
+        for f in bm.faces:
+            key = frozenset(v.index for v in f.verts)
+            if key in seen:
+                dupes.append(f)
+            seen.add(key)
+        bmesh.ops.delete(bm, geom=dupes, context="FACES")
+    else:
+        for _ in range(3):  # fins: faces hanging off an over-shared edge, peeled layer by layer
+            fins = [f for f in bm.faces if sum(1 for e in f.edges if len(e.link_faces) != 2) >= 2
+                    and any(len(e.link_faces) > 2 for e in f.edges)]
+            if not fins:
+                break
+            bmesh.ops.delete(bm, geom=fins, context="FACES")
+        over = [e for e in bm.edges if len(e.link_faces) > 2]
+        if over:  # remaining 3+-face edges: split so each sheet can be closed on its own
+            bmesh.ops.split_edges(bm, edges=over)
+    bmesh.ops.delete(bm, geom=[v for v in bm.verts if not v.link_faces], context="VERTS")
+    boundary = [e for e in bm.edges if e.is_boundary]
+    if boundary:
+        res = bmesh.ops.holes_fill(bm, edges=boundary, sides=0)
+        if res["faces"]:
+            bmesh.ops.triangulate(bm, faces=res["faces"])
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+
+
+def repair_manifold(obj) -> dict:
+    """Close the topology without changing the shape: merge, drop duplicate and dangling faces, fill holes.
+
+    Exact booleans, quadriflow and decimation occasionally leave duplicate faces
+    (coplanar overlaps), fins on an edge shared by 3+ faces and slit holes. Each
+    pass is kept only if it leaves fewer open edges.
+    """
+    lo, hi = bbox([obj])
+    tol = 1e-5 * max(float(np.max(hi - lo)), 1e-6)
+    bm = bmesh.new()
+    bm.from_mesh(obj.data)
+    before = best = _count_open(bm)
+    for aggressive in (False, True):
+        if not best:
+            break
+        work = bm.copy()
+        _repair_pass(work, tol, aggressive)
+        n = _count_open(work)
+        if n < best:
+            bm.free()
+            bm, best = work, n
+        else:
+            work.free()
+    if best < before:
+        bm.to_mesh(obj.data)
+        obj.data.update()
+    bm.free()
+    if before:
+        log(f"repair: {obj.name} open edges {before} -> {best}")
+    return {"open_edges_before": before, "open_edges_after": best}
+
+
+def surface_area(obj) -> float:
+    return sum(poly.area for poly in obj.data.polygons)
+
+
+def voxel_seal(obj, resolution: int, target_faces: int = 0) -> int:
+    """Last resort: rebuild the surface as a voxel shell (closed by construction), keeping the shape.
+
+    The voxel size is chosen to land near ``target_faces`` directly; decimating the
+    shell afterwards could open it again.
+    """
+    ref = obj.copy()
+    ref.data = obj.data.copy()
+    bpy.context.scene.collection.objects.link(ref)
+    lo, hi = bbox([obj])
+    voxel = float(np.max(hi - lo)) / max(16, resolution)
+    if target_faces:
+        voxel = max(voxel, math.sqrt(surface_area(obj) / target_faces))
+    voxel_remesh(obj, voxel)
+    shrinkwrap_to(obj, ref)
+    bpy.data.objects.remove(ref, do_unlink=True)
+    repair_manifold(obj)
+    return open_edges(obj)
 
 
 def _euler_matrices(angles_deg: "np.ndarray") -> "np.ndarray":
@@ -743,8 +847,14 @@ def op_cleanup(p: dict) -> dict:
     obj.name = p["name"]
     obj["asset_role"] = "target"
     mode = p["remesh_mode"]
-    voxel_size = size / max(16, int(p["voxel_resolution"]))
     target_faces = int(p["target_faces"])
+    # Remesh at unit size and scale back afterwards: remeshers have absolute tolerances, and the
+    # same scan should behave identically as a 2 cm coin or a 632 m skyscraper.
+    unit = 1.0 / max(size, 1e-9)
+    for o in (obj, high):
+        o.scale = (unit, unit, unit)
+        apply_transforms(o)
+    voxel_size = 1.0 / max(16, int(p["voxel_resolution"]))
 
     if p.get("symmetrize"):
         # Characters: mirror the better-reconstructed +X half onto -X. Clean symmetric
@@ -765,8 +875,8 @@ def op_cleanup(p: dict) -> dict:
         # Quadriflow needs a manifold input; voxel remesh guarantees one and also
         # unions intersecting shells.
         voxel_remesh(obj, voxel_size)
-        # Quadriflow time grows with input size; a dense voxel shell gains nothing past ~20x target
-        decimate_to(obj, target_faces * 20, passes=1)
+        # Quadriflow time grows with input size; a dense voxel shell gains nothing past ~8x target
+        decimate_to(obj, int(min(max(target_faces * 8, 20000), 100000)), passes=1)
         if quadriflow(obj, target_faces):
             shrinkwrap_to(obj, high)
             report["remesh"] = "quadriflow"
@@ -789,8 +899,16 @@ def op_cleanup(p: dict) -> dict:
         report["remesh"] = "none"
 
     report.update({f"post_{k}": v for k, v in bm_cleanup(
-        obj, 1e-6 * size, p["min_island_ratio"], fill_holes=p.get("fill_holes", True)).items()})
+        obj, 1e-6, p["min_island_ratio"], fill_holes=p.get("fill_holes", True)).items()})
     smooth(obj, int(p.get("smooth_iterations", 0)))
+    report["repair"] = repair_manifold(obj)
+    if report["repair"]["open_edges_after"] and mode != "none":
+        left = voxel_seal(obj, int(p["voxel_resolution"]), target_faces)
+        report["repair"].update(voxel_seal=True, open_edges_after=left)
+        report["remesh"] += " +voxel seal"
+    for o in (obj, high):
+        o.scale = (size, size, size)
+        apply_transforms(o)
     auto_smooth(obj, float(p.get("auto_smooth_angle", 40.0)))
     report["collisions_after"] = island_collisions(obj)
     frame = _translation(ground_and_center(obj, followers=[high])) @ frame  # bake source stays aligned
@@ -1342,12 +1460,28 @@ def op_primitives(p: dict) -> dict:
             for o in cutters:
                 bpy.data.objects.remove(o, do_unlink=True)
             continue
+        use_boolean = p.get("union", True)
         try:
-            obj = union_objects(unions, p.get("union", True))
+            obj = union_objects(unions, use_boolean)
         except RuntimeError as exc:
             log(f"primitives: {exc}; joining without boolean")
             obj = union_objects([o for o in unions if _alive(o)], False)
+            use_boolean = False
         subtract_objects(obj, cutters)  # openings: doors, arches, crenels
+        if repair_manifold(obj)["open_edges_after"] and use_boolean:
+            # Coplanar unions can leave open seams: rebuild as cut, separately closed shells instead
+            log(f"primitives: group '{part_name or 'body'}' not watertight after union; rebuilding as shells")
+            bpy.data.objects.remove(obj, do_unlink=True)
+            shells = [component_object(c, lo, size, slots) for c in members if c.get("operation", "union") == "union"]
+            cutters = [component_object(c, lo, size, slots) for c in members if c.get("operation") == "subtract"]
+            for shell in shells:
+                for cutter in cutters:
+                    boolean(shell, cutter, "DIFFERENCE")
+                repair_manifold(shell)
+            for cutter in cutters:
+                bpy.data.objects.remove(cutter, do_unlink=True)
+            obj = union_objects(shells, False)
+            report.setdefault("rebuilt_as_shells", []).append(part_name or "body")
         built[part_name] = obj
 
     if "" not in built:
@@ -2290,6 +2424,8 @@ def op_segment(p: dict) -> dict:
             bpy.data.objects.remove(box, do_unlink=True)
             for o in (body, new):  # exact booleans on n-gon meshes can leave slivers open
                 close_small_holes(o)
+                if repair_manifold(o)["open_edges_after"] and p.get("voxel_seal", True):
+                    voxel_seal(o, int(p.get("voxel_resolution", 192)))
             if face_count(body) < 0.2 * faces_before:
                 log(f"segment: warning - cutting {part['name']} removed most of the body")
         new.name = f"{body.name}_{part['name']}"

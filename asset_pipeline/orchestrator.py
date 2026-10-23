@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .blender_automation import BlenderRunner
+from .blender_automation import BlenderRunner, BlenderTimeout
 from .concept_planner import AssetSpec, ConceptPlanner, spec_from_knowledge_base
 from .config import Config, find_blender
 from .llm_client import LLMClient, LLMError
@@ -370,8 +370,21 @@ class Pipeline:
                 start = time.time()
                 log.info("STAGE 3 - topology cleanup / remesh / scale (%s)", cleanup["remesh_mode"])
                 geometry_blend = str(it_dir / "stage3_topology.blend")
-                record["stage3"] = runner.run("cleanup", dict(cleanup, input_mesh=ctx.raw_mesh,
-                                                              output_blend=geometry_blend), tag=f"it{it}_cleanup")
+                try:
+                    record["stage3"] = runner.run("cleanup", dict(cleanup, input_mesh=ctx.raw_mesh,
+                                                                  output_blend=geometry_blend), tag=f"it{it}_cleanup",
+                                                  timeout_s=self.cfg.blender.cleanup_timeout_s)
+                except BlenderTimeout:
+                    if cleanup["remesh_mode"] == "voxel":
+                        raise
+                    log.warning("Stage 3 exceeded %ss with %s; retrying with voxel remeshing",
+                                self.cfg.blender.cleanup_timeout_s, cleanup["remesh_mode"])
+                    cleanup = dict(cleanup, remesh_mode="voxel")
+                    record["stage3_timeout_fallback"] = "voxel"
+                    record["stage3"] = runner.run("cleanup", dict(cleanup, input_mesh=ctx.raw_mesh,
+                                                                  output_blend=geometry_blend),
+                                                  tag=f"it{it}_cleanup_voxel",
+                                                  timeout_s=self.cfg.blender.cleanup_timeout_s)
                 self._timed(ctx, "stage3_topology", start)
 
                 # STAGE 3b - rebuild hard-surface assets from primitive templates
@@ -398,7 +411,8 @@ class Pipeline:
                     segmented = str(it_dir / "stage5_segmented.blend")
                     record["stage5"] = runner.run("segment", dict(
                         input_blend=geometry_blend, output_blend=segmented, parts=todo,
-                        clearance_mm=ctx.options.print_clearance_mm), tag=f"it{it}_segment")
+                        clearance_mm=ctx.options.print_clearance_mm,
+                        voxel_resolution=cleanup["voxel_resolution"]), tag=f"it{it}_segment")
                     geometry_blend = segmented
                     self._timed(ctx, "stage5_rigging", start)
             prev_cleanup, prev_geometry = cleanup, geometry_blend
