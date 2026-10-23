@@ -1,0 +1,80 @@
+# Copy to config.yaml and edit. Every key is optional; defaults live in
+# asset_pipeline/config.py. Env overrides: ASSET_PIPELINE_<SECTION>__<KEY>=value
+
+llm:                         # Stage 1 concept planner (text)
+  provider: ollama           # ollama | openai_compatible (vLLM / LM Studio / llama.cpp) | openai | anthropic
+  model: qwen2.5:14b-instruct
+  base_url: http://localhost:11434   # vLLM: http://localhost:8000  LM Studio: http://localhost:1234
+  api_key_env: ""            # e.g. ANTHROPIC_API_KEY / OPENAI_API_KEY for cloud providers
+  temperature: 0.2
+
+vision:                      # Stage 6 auditor (must accept images)
+  provider: ollama
+  model: qwen2.5vl:7b        # alternatives: llava:13b, minicpm-v, or cloud claude-sonnet-5-5 / gpt-4o
+  base_url: http://localhost:11434
+
+diffusion:                   # Stage 1 reference images
+  backend: diffusers         # diffusers | comfyui
+  model_id: stabilityai/stable-diffusion-xl-base-1.0   # or black-forest-labs/FLUX.1-schnell
+  pipeline_type: auto        # auto | sdxl | flux | sd
+  steps: 30
+  guidance_scale: 6.0
+  width: 1024
+  height: 1024
+  enable_cpu_offload: false  # true on <12 GB cards
+  comfyui_url: http://127.0.0.1:8188
+  comfyui_workflow: ""       # API-format JSON with {{prompt}} {{negative}} {{seed}} {{width}} {{height}}
+  comfyui_checkpoint: sd_xl_base_1.0.safetensors
+  views: [isometric, front, side]
+
+preprocess:
+  rembg_model: isnet-general-use
+  foreground_ratio: 0.85
+  output_size: 512
+
+reconstruction:              # Stage 2
+  backend: triposr           # triposr | instantmesh | openlrm | command | primitive
+  device: cuda:0
+  triposr_repo: third_party/TripoSR
+  mc_resolution: 256         # marching-cubes grid; 320-384 for more detail (more VRAM)
+  instantmesh_repo: third_party/InstantMesh
+  instantmesh_python: third_party/InstantMesh/.venv/bin/python
+  instantmesh_config: configs/instant-mesh-large.yaml
+  openlrm_repo: third_party/OpenLRM
+  openlrm_python: third_party/OpenLRM/.venv/bin/python
+  # command backend example (TRELLIS / Hunyuan3D / SF3D CLI); placeholders: {python} {input} {input_rgba} {output_dir}
+  command_template: ""
+
+blender:
+  executable: ""             # auto-detect; or e.g. /opt/blender-4.2/blender, C:\Program Files\Blender Foundation\Blender 4.2\blender.exe
+  use_gpu: true              # Cycles baking/rendering on OptiX/CUDA/HIP
+  timeout_s: 3600
+
+cleanup:                     # Stage 3 (the audit loop adjusts these)
+  remesh_mode: quadriflow    # quadriflow | voxel | voxel_shrinkwrap | decimate | none
+  voxel_resolution: 192
+  target_faces: 0            # 0 = planner's per-asset budget
+  smooth_iterations: 1
+  auto_smooth_angle: 40.0
+  min_island_ratio: 0.02
+  import_rotation_deg: [0.0, 0.0, 0.0]
+
+texture:                     # Stage 4
+  resolution: 2048           # 1024 | 2048 | 4096
+  uv_method: smart           # smart | seams | lightmap
+  albedo_source: bake        # bake (from reconstruction colours) | projection (reference views) | procedural
+  cage_extrusion: 0.01
+  bake_samples: 16
+
+render:                      # Stage 6 audit renders
+  resolution: 1024
+  engine: auto               # auto/cycles (works headless everywhere) | eevee | workbench
+  samples: 32
+  include_uv_checker: true
+
+pipeline:
+  output_dir: output
+  max_iterations: 3
+  approval_score: 0.75
+  unload_models_between_stages: true
+  seed: 42

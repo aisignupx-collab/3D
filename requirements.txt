@@ -1,0 +1,23 @@
+# Core orchestrator (install PyTorch FIRST with the CUDA index URL - see README)
+requests>=2.31
+PyYAML>=6.0
+numpy>=1.26
+Pillow>=10.0
+trimesh>=4.0
+
+# Stage 1: background removal (use rembg[gpu] for onnxruntime-gpu)
+rembg>=2.0.57
+
+# Stage 1: local diffusion
+diffusers>=0.30
+transformers>=4.44
+accelerate>=0.33
+safetensors>=0.4
+sentencepiece>=0.2      # FLUX T5 tokenizer
+protobuf>=4.25
+
+# Stage 2: TripoSR (in-process). torchmcubes must be built against the installed torch:
+#   pip install --no-build-isolation git+https://github.com/tatsy/torchmcubes.git
+omegaconf>=2.3
+einops>=0.7
+huggingface_hub>=0.24
