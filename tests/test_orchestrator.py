@@ -72,3 +72,17 @@ def test_reference_projection_and_character_settings():
     assert knight["symmetrize"] is True and knight["max_tilt_correction"] == 0.0
     chest = pipe._cleanup_params(spec_from_knowledge_base("a treasure chest"), cam)
     assert chest["symmetrize"] is False and chest["reference_camera"] == cam
+
+
+def test_castles_keep_their_scan_layout():
+    pipe = Pipeline(Config())
+    spec = spec_from_knowledge_base("a medieval castle")
+    assert spec.category == "architecture" and spec.fit_dimension == "height"
+    params = pipe._cleanup_params(spec)
+    assert params["per_axis_fit"] is False and params["match_spec_axes"] is False
+    assert pipe._shape_components(spec) == []  # built from the scan in Blender, never a planner guess
+    names = {m["name"] for m in pipe._materials(spec, [])}
+    assert {"stone", "roof"} <= names
+    assert pipe._mirror_axes(spec) == ["X"]
+    crate = spec_from_knowledge_base("a wooden crate")
+    assert pipe._cleanup_params(crate)["match_spec_axes"] is True

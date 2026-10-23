@@ -269,6 +269,10 @@ class LLMClient:
         }
         if self.seed is not None:
             payload["seed"] = self.seed
+        if self.provider == "lmstudio" and self.keep_alive == "0":
+            # LM Studio's idle TTL (seconds) for just-in-time loaded models: frees the VRAM for
+            # diffusion / TripoSR soon after the call. Models you loaded by hand stay loaded.
+            payload["ttl"] = 30
         # response_format is not implemented by every local server, so JSON is
         # requested in the prompt and parsed leniently instead.
         if json_mode and self.provider in ("openai", "deepseek", "gemini"):

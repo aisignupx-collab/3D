@@ -209,3 +209,16 @@ def test_vision_proportion_issues_are_advisory():
         {"category": "geometry", "severity": "medium", "description": "lumpy", "fix": "reduce_noise"}]})
     assert (issues[0].fix, issues[0].severity) == (None, "low")
     assert issues[1].fix == "reduce_noise"
+
+
+def test_castle_footprint_is_not_audited_against_the_plan():
+    from asset_pipeline.concept_planner import spec_from_knowledge_base
+
+    spec = spec_from_knowledge_base("a medieval castle")  # 32 x 28 x 24 m, fitted on height
+    m = {spec.name: {"faces": 9000, "boundary_edges": 0, "non_manifold_edges": 0, "small_islands": 0,
+                     "dimensions_m": [18.0, 40.0, 24.0]}}
+    issues = check_metrics(m, spec, 12000, assembled_dims=[18.0, 40.0, 24.0])
+    assert not [i for i in issues if i.fix == "rescale_axis"]
+    m[spec.name]["dimensions_m"] = [18.0, 40.0, 12.0]
+    issues = check_metrics(m, spec, 12000, assembled_dims=[18.0, 40.0, 12.0])
+    assert [i.params["axis"] for i in issues if i.fix == "rescale_axis"] == ["Z"]

@@ -156,6 +156,11 @@ class ShapeConfig:
     blueprint: bool = True
     blueprint_max_error: float = 0.05
     blueprint_resolution: int = 256  # silhouette cells along the longest axis
+    # Skyline layout for castles and other composite buildings: towers, walls and roofs are
+    # read from the scan's roofline (top-down height map) instead of a fixed recipe
+    skyline_max_error: float = 0.1
+    skyline_grid: int = 64  # height-map cells per side
+    battlements: bool = True  # merlons on flat tower tops and wall tops
 
 
 @dataclass
@@ -176,6 +181,10 @@ class TextureConfig:
     project_reference: bool = True
     min_projection_iou: float = 0.7  # silhouette agreement required to trust the camera
     mirror_fill: bool = True  # fill unseen faces from the mirrored view on symmetric assets
+    # Template surfaces the reference camera never saw (backs, roofs): "tiles" = a tiling texture
+    # per material (cut from the reference image, else procedural stone/shingles/planks);
+    # "bake" = the reconstruction's colour guess
+    unseen_fill: str = "tiles"
 
 
 @dataclass

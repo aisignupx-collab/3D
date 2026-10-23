@@ -8,6 +8,9 @@ the reconstruction. This module holds:
 * :class:`ShapeComponent` - one primitive placed in the asset's normalised
   bounding box (``[0,0,0]`` = min corner, ``[1,1,1]`` = max corner),
 * a recipe library for common assets (chest, barrel, castle tower, ...),
+* layouts generated from the scan itself (``skyline``: castles and other
+  composite buildings are split into towers, walls and roofs where the scan's
+  roofline says they are, instead of one shape stretched over the whole bbox),
 * validation for recipes proposed by the planner LLM.
 
 Blender builds and fits the components (``op_primitives`` in
@@ -34,6 +37,8 @@ PRIMITIVES: Dict[str, str] = {
     "wedge": "triangular prism, ridge along axis, apex up +Z (gable roofs, ramps, blades)",
     "pyramid": "square pyramid/frustum, apex towards +axis; taper = top size ratio (spires, tips)",
     "torus": "ring around axis; thickness = tube/outer radius (hoops, bands, rims, tyres)",
+    "merlon_ring": "battlement teeth around a round top along axis; segments = tooth count, "
+                   "thickness = wall depth/radius (crenellated round towers)",
 }
 AXES = ("X", "Y", "Z", "+X", "+Y", "+Z", "-X", "-Y", "-Z")
 ORGANIC = ("character", "creature")
@@ -203,14 +208,37 @@ RECIPES: List[Dict[str, Any]] = [
 ]
 
 
+# Composite buildings whose layout (how many towers, where) differs per asset: no fixed recipe
+# can match them, so Blender derives the components from the scan's roofline.
+SKYLINE_KEYWORDS = ["castle", "fortress", "citadel", "stronghold", "fort", "palace", "cathedral", "church",
+                    "temple", "monastery", "manor", "mansion", "village", "town", "city"]
+
+
 def _match(prompt: str, keywords: List[str]) -> int:
     text = prompt.lower()
     return max((len(k) for k in keywords if re.search(rf"\b{re.escape(k)}\b", text)), default=0)
 
 
+def layout_for(prompt: str, category: str = "") -> str:
+    """How Stage 3b builds this asset: "recipe", "skyline" (derived from the scan) or "" (classify).
+
+    A specific recipe keyword beats a skyline keyword when it is longer ("castle gate" ->
+    gate recipe, "castle" -> skyline); architecture without any recipe uses the skyline too.
+    """
+    if category in ORGANIC:
+        return ""
+    recipe_len = max((_match(prompt, e["keywords"]) for e in RECIPES), default=0)
+    skyline_len = _match(prompt, SKYLINE_KEYWORDS)
+    if skyline_len and skyline_len >= recipe_len:
+        return "skyline"
+    if recipe_len:
+        return "recipe"
+    return "skyline" if category == "architecture" else ""
+
+
 def recipe_for(prompt: str, category: str = "") -> List[ShapeComponent]:
     """Best-matching library recipe for a prompt (empty for organic assets / no match)."""
-    if category in ORGANIC:
+    if category in ORGANIC or layout_for(prompt, category) == "skyline":
         return []
     best, best_len = None, 0
     for entry in RECIPES:

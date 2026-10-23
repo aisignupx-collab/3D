@@ -29,7 +29,7 @@ from .config import Config, find_blender
 from .llm_client import LLMClient, LLMError
 from .mesh_reconstruction import MeshReconstructor
 from .reference_generator import ReferenceGenerator, ReferenceSet
-from .shape_templates import DEFAULT_MATERIALS, ShapeComponent, expand_arrays, recipe_for
+from .shape_templates import DEFAULT_MATERIALS, ShapeComponent, expand_arrays, layout_for, recipe_for
 from .vision_auditor import AuditReport, VisionAuditor, apply_fixes, apply_rig_fixes
 
 log = logging.getLogger(__name__)
@@ -259,8 +259,11 @@ class Pipeline:
             params["max_tilt_correction"] = 0.0  # yaw only: an A-pose body has no upright min box
         params.update(name=spec.name, dimensions=spec.dimensions, fit_dimension=spec.fit_dimension,
                       axis_scale={}, reference_camera=camera, organic=spec.is_organic,
-                      # Bodies keep their image proportions; objects are fitted to real-world size
-                      per_axis_fit=not spec.is_organic,
+                      # Bodies and composite buildings keep their image proportions (a castle's
+                      # footprint is whatever its towers make it); objects are fitted to real-world size
+                      per_axis_fit=not spec.is_organic and layout_for(spec.prompt, spec.category) != "skyline",
+                      # buildings are reconstructed upright from their picture; their planned size is rough
+                      match_spec_axes=layout_for(spec.prompt, spec.category) != "skyline",
                       symmetrize=spec.is_organic and params.pop("symmetrize_characters"))
         params.pop("symmetrize_characters", None)
         return params
@@ -272,6 +275,8 @@ class Pipeline:
             return ["X"]  # left/right only - never paint the face onto the back of the head
         if spec.category in ELONGATED:
             return ["Y"]  # left/right flank - never swap muzzle and stock
+        if spec.category == "architecture":
+            return ["X"]  # never paint the gate and facade onto the back of a building
         return ["X", "Y"]
 
     def _shape_components(self, spec: AssetSpec) -> Optional[List[Dict[str, Any]]]:
@@ -281,6 +286,10 @@ class Pipeline:
         """
         if self.cfg.shapes.mode == "mesh" or spec.is_organic:
             return None
+        if layout_for(spec.prompt, spec.category) == "skyline":
+            # Composite buildings: towers/walls come from the scan in Blender. A planner-improvised
+            # recipe (one cylinder for a four-tower castle) is never better than the scan's layout.
+            return []
         # Curated library recipes beat planner-improvised ones (a car must keep its wheels)
         comps = [c.to_dict() for c in recipe_for(spec.prompt, spec.category)] or spec.shapes
         if not comps and spec.category in ELONGATED and not self.cfg.shapes.blueprint:
@@ -292,8 +301,10 @@ class Pipeline:
         """Spec palette plus PBR defaults for any material a template references."""
         mats = [dataclasses.asdict(m) for m in spec.materials]
         names = {m["name"] for m in mats}
-        for comp in components or []:
-            name = comp.get("material")
+        referenced = [c.get("material") for c in components or []]
+        if layout_for(spec.prompt, spec.category) == "skyline":
+            referenced += ["stone", "roof"]  # generated in Blender: walls/towers and roofs
+        for name in referenced:
             if name and name not in names and name in DEFAULT_MATERIALS:
                 mats.append(dict(name=name, coverage=0.1, **DEFAULT_MATERIALS[name]))
                 names.add(name)
@@ -308,6 +319,9 @@ class Pipeline:
         try:
             result = runner.run("primitives", dict(
                 input_blend=blend, output_blend=out, components=components, mode=shapes.mode,
+                layout=layout_for(spec.prompt, spec.category), skyline_fallback=spec.category == "architecture",
+                skyline_max_error=shapes.skyline_max_error, skyline_grid=shapes.skyline_grid,
+                battlements=shapes.battlements,
                 recipe_max_error=shapes.recipe_max_error, classify_max_error=shapes.classify_max_error,
                 union=shapes.union, refine=shapes.refine, materials=materials,
                 # A single box/cylinder guess would erase a weapon's or vehicle's detail

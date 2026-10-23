@@ -247,7 +247,8 @@ def test_unbaked_texels_are_filled(runner, raw_mesh, tmp_path):
     tex = runner.run("texture", dict(input_blend=str(tmp_path / "ut.blend"), output_blend=str(tmp_path / "ux.blend"),
                                      texture_dir=str(tmp_path / "utex"), resolution=128, uv_method="smart",
                                      uv_angle_limit=66, island_margin=0.01, bake_margin_px=2, cage_extrusion=1e-5,
-                                     bake_samples=1, albedo_source="bake", materials=mats, bake_normal=False),
+                                     bake_samples=1, albedo_source="bake", materials=mats, bake_normal=False,
+                                     unseen_fill="bake"),  # tiles would cover these texels first
                      tag="u_tex")
     assert tex["unbaked_fraction"] > 0.05
     from PIL import Image
@@ -321,3 +322,37 @@ def test_resume_continues_instead_of_restarting(tmp_path, monkeypatch):
     # Nothing left to do: a second resume only re-exports
     final = orch.Pipeline(cfg).run(orch.RunOptions(resume=str(first.run_dir), offline=True, target_format="fbx"))
     assert len(final.iterations) == 2 and final.export["output"].endswith(".fbx")
+
+
+def test_castle_skyline_layout(runner, tmp_path):
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).parent / "fixtures"))
+    from make_castle import write_obj
+
+    raw = write_obj(str(tmp_path / "castle.obj"))
+    runner.run("cleanup", cleanup_params(raw, tmp_path / "c.blend", name="castle", dimensions=[30.0, 26.0, 27.0],
+                                         fit_dimension="height", remesh_mode="voxel", voxel_resolution=96,
+                                         smooth_iterations=3, import_rotation_deg=[0, 0, 0], per_axis_fit=False),
+               tag="castle_clean")
+    mats = [{"name": "stone", "base_color": [0.45, 0.43, 0.4], "metallic": 0.0, "roughness": 0.9, "coverage": 0.85},
+            {"name": "roof", "base_color": [0.3, 0.14, 0.1], "metallic": 0.0, "roughness": 0.8, "coverage": 0.15}]
+    res = runner.run("primitives", dict(input_blend=str(tmp_path / "c.blend"), output_blend=str(tmp_path / "cs.blend"),
+                                        components=[], layout="skyline", materials=mats, default_material="stone"),
+                     tag="castle_skyline")
+    sky = res["skyline"]
+    assert res["used"] and res["source"] == "skyline", res
+    assert sky["towers"] == 4 and sky["roofs"] == 2, sky
+    assert sky["wall_blocks"] >= 2
+    assert all(m["watertight"] for m in res["metrics"].values())
+    kinds = {c["type"] for c in res["components"]}
+    assert {"cylinder", "cone", "merlon_ring", "box"} <= kinds
+    tex = runner.run("texture", dict(input_blend=str(tmp_path / "cs.blend"), output_blend=str(tmp_path / "ct.blend"),
+                                     texture_dir=str(tmp_path / "ctex"), resolution=512, uv_method="smart",
+                                     uv_angle_limit=66, island_margin=0.005, bake_margin_px=2,
+                                     cage_extrusion=res["cage_hint"], bake_samples=1, albedo_source="bake",
+                                     materials=mats, bake_normal=False), tag="castle_tex")
+    tiles = tex["material_tiles"]
+    assert set(tiles) == {"stone", "roof"} and all(t["source"] == "procedural" for t in tiles.values())
+    assert tex["unbaked_fraction"] < 0.01

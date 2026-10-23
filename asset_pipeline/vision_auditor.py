@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .concept_planner import AssetSpec
 from .llm_client import LLMClient, LLMError
+from .shape_templates import layout_for
 
 log = logging.getLogger(__name__)
 
@@ -117,8 +118,12 @@ def check_metrics(metrics: Dict[str, Dict[str, Any]], spec: AssetSpec, face_budg
     if dims:
         # Thin axes need an absolute floor too: a 2 cm door handle is +40% of a 5 cm door
         floor = 0.03 * max(spec.dimensions)
+        # Composite buildings take their footprint from the scan (how many towers, where);
+        # only the fitted dimension is a real-world target for them
+        fitted_only = layout_for(spec.prompt, spec.category) == "skyline"
+        fit_axis = {"length": "X", "width": "Y", "height": "Z"}.get(spec.fit_dimension)
         for axis, measured, target in zip("XYZ", dims, spec.dimensions):
-            if target <= 0:
+            if target <= 0 or (fitted_only and fit_axis and axis != fit_axis):
                 continue
             err = measured / target - 1.0
             if abs(err) > 0.25 and abs(measured - target) > floor:

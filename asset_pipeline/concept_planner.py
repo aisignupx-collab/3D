@@ -233,6 +233,17 @@ KNOWLEDGE_BASE: List[Dict[str, Any]] = [
                       MaterialSpec("iron", [0.16, 0.16, 0.17], 1.0, 0.55, 0.15)],
     },
     {
+        "keywords": ["castle", "fortress", "citadel", "stronghold", "fort"],
+        "category": "architecture",
+        "dims": (32.0, 28.0, 24.0),
+        "fit": "height",
+        "notes": "Small castles: towers 6-12 m across and 15-30 m tall, curtain walls 8-12 m tall and 2-3 m "
+                 "thick, merlons ~1.8 m tall. The layout (number and position of towers) comes from the "
+                 "reference, so footprint proportions are taken from the scan.",
+        "materials": [MaterialSpec("stone", [0.45, 0.43, 0.40], 0.0, 0.9, 0.85),
+                      MaterialSpec("roof", [0.30, 0.14, 0.10], 0.0, 0.8, 0.15)],
+    },
+    {
         "keywords": ["tower", "turret", "castle tower", "keep"],
         "category": "architecture",
         "dims": (6.0, 6.0, 16.0),

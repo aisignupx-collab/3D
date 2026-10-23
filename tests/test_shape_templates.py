@@ -83,3 +83,16 @@ def test_no_single_shape_guess_for_weapons():
     cfg.shapes.blueprint = False
     assert Pipeline(cfg)._shape_components(spec_from_knowledge_base("MP5 submachine gun")) is None
     assert pipe._shape_components(spec_from_knowledge_base("a longsword"))  # has a recipe
+
+
+def test_composite_buildings_use_the_skyline_layout():
+    from asset_pipeline.shape_templates import layout_for
+
+    assert layout_for("a medieval castle", "architecture") == "skyline"
+    assert layout_for("a gothic cathedral", "prop") == "skyline"  # keyword wins over a wrong category
+    assert layout_for("a castle gate", "architecture") == "recipe"  # the longer, specific keyword
+    assert layout_for("a castle tower", "architecture") == "recipe"
+    assert layout_for("a lighthouse", "architecture") == "skyline"  # buildings without a recipe
+    assert layout_for("a wooden crate", "prop") == "recipe"
+    assert layout_for("a knight", "character") == ""
+    assert recipe_for("a medieval castle", "architecture") == []

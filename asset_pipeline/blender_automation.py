@@ -29,6 +29,7 @@ import sys
 import time
 import traceback
 from pathlib import Path
+from typing import List, Optional, Tuple
 
 try:
     import bmesh
@@ -653,6 +654,11 @@ def best_axis_permutation(obj, target_dims, min_gain: float = 0.35):
     lo, hi = bbox([obj])
     dims = hi - lo
     base = _shape_error(dims, target_dims)
+    t = np.asarray(target_dims, float)
+    if t.max() / max(t.min(), 1e-9) < 1.5:
+        # A near-cubic spec (a castle, a crate) can't tell its axes apart: an upright scan that is a
+        # little wider than planned would be tipped over. Keep the reconstruction's own up axis.
+        return [0.0, 0.0, 0.0], round(base, 3)
     best, best_err = (0, 0, 0), base
     for euler in AXIS_PERMUTATIONS[1:]:
         rot = np.abs(_euler_matrices(np.array([euler], float))[0])
@@ -967,6 +973,25 @@ def _wedge(bm):
         bm.faces.new([v[i] for i in face])
 
 
+def _merlon_ring(bm, teeth, depth=0.12):
+    """``teeth`` battlement blocks on a circle of outer radius 0.5, teeth and gaps equally wide."""
+    teeth = max(4, int(teeth))
+    r_out, r_in = 0.5, 0.5 * (1.0 - min(max(depth, 0.03), 0.6))
+    half = math.pi / (2 * teeth)
+    for k in range(teeth):
+        a = 2 * math.pi * k / teeth
+        ring = []
+        for z in (-0.5, 0.5):
+            for r, ang in ((r_in, a - half), (r_out, a - half), (r_out, a + half), (r_in, a + half)):
+                ring.append(bm.verts.new((r * math.cos(ang), r * math.sin(ang), z)))
+        b, t = ring[:4], ring[4:]
+        bm.faces.new(b[::-1])
+        bm.faces.new(t)
+        for i in range(4):
+            j = (i + 1) % 4
+            bm.faces.new((b[i], b[j], t[j], t[i]))
+
+
 def build_unit_primitive(kind: str, segments: int = 24, taper: float = 0.0, thickness: float = 0.3):
     """Canonical primitive filling [-0.5, 0.5]^3 with clean topology.
 
@@ -996,6 +1021,8 @@ def build_unit_primitive(kind: str, segments: int = 24, taper: float = 0.0, thic
         _wedge(bm)
     elif kind == "torus":
         _torus(bm, segments, thickness)
+    elif kind == "merlon_ring":
+        _merlon_ring(bm, segments, thickness)
     else:
         bm.free()
         raise ValueError(f"unknown primitive '{kind}'")
@@ -1176,6 +1203,232 @@ def subtract_objects(base, cutters):
         mod.object = o
         apply_modifier(base, mod)
         bpy.data.objects.remove(o, do_unlink=True)
+
+
+# ----------------------------------------------------------------- skyline layout
+#
+# Castles, churches and other composite buildings differ in how many towers they have and
+# where, so no fixed recipe fits them (one cylinder stretched over a four-tower castle). Their
+# layout is read from the scan instead: a top-down height map is split at the heights where
+# the roofline separates into distinct peaks. Every peak becomes a tower - round or square,
+# with a cone/pyramid roof when it rises to a point, else a crenellated top - and the mass
+# joining them becomes wall blocks.
+
+def height_map(obj, lo, hi, grid: int) -> "np.ndarray":
+    """(grid, grid) first-hit heights seen from above, normalised to 0..1; -1 = empty. Row = Y."""
+    bvh = _bvh([obj])
+    size = hi - lo
+    top = float(hi[2] + 0.01 * size[2])
+    down = mathutils.Vector((0.0, 0.0, -1.0))
+    H = -np.ones((grid, grid))
+    for i in range(grid):
+        y = float(lo[1] + (i + 0.5) / grid * size[1])
+        for j in range(grid):
+            x = float(lo[0] + (j + 0.5) / grid * size[0])
+            hit = bvh.ray_cast(mathutils.Vector((x, y, top)), down, float(size[2]) * 1.05)[0]
+            if hit is not None:
+                H[i, j] = (hit.z - lo[2]) / size[2]
+    # 3x3 median over valid cells: scan noise must not split one roof into two peaks
+    valid = H >= 0
+    stack = np.stack([np.where(_shift(valid, dy, dx), _shift(H, dy, dx), np.nan)
+                      for dy in (-1, 0, 1) for dx in (-1, 0, 1)])
+    with np.errstate(all="ignore"):
+        med = np.nanmedian(stack, axis=0)
+    return np.where(valid, np.nan_to_num(med, nan=-1.0), -1.0)
+
+
+def _max_rectangle(mask) -> Tuple[int, Optional[Tuple[int, int, int, int]]]:
+    """Largest all-True axis-aligned rectangle: (area, (row0, col0, row1, col1) inclusive)."""
+    h, w = mask.shape
+    heights = np.zeros(w, int)
+    best = (0, None)
+    for i in range(h):
+        heights = np.where(mask[i], heights + 1, 0)
+        stack: List[Tuple[int, int]] = []
+        for j in range(w + 1):
+            cur = int(heights[j]) if j < w else 0
+            start = j
+            while stack and stack[-1][1] >= cur:
+                s0, hh = stack.pop()
+                if hh * (j - s0) > best[0]:
+                    best = (hh * (j - s0), (i - hh + 1, s0, i, j - 1))
+                start = s0
+            stack.append((start, cur))
+    return best
+
+
+def rectangle_cover(mask, max_rects: int = 6, coverage: float = 0.9, min_cells: int = 4):
+    """A few rectangles covering ``mask`` (greedy largest-first)."""
+    remaining = mask.copy()
+    total = int(mask.sum())
+    rects = []
+    while len(rects) < max_rects and remaining.sum() > (1.0 - coverage) * total:
+        area, rect = _max_rectangle(remaining)
+        if rect is None or area < min_cells:
+            break
+        r0, c0, r1, c1 = rect
+        remaining[r0:r1 + 1, c0:c1 + 1] = False
+        if min(r1 - r0, c1 - c0) >= 1:  # at least 2 cells thick: no sliver walls
+            rects.append(rect)
+    return rects
+
+
+def _peaks_above(H, region, t, min_cells):
+    labels, sizes = _components(region & (H > t), connectivity4=False)
+    subs = [labels == k for k, n in enumerate(sizes) if k and n >= min_cells]
+    return [m for m in subs if np.percentile(H[m], 90) > t + 0.05]  # clearly above the split
+
+
+def _skyline_elements(H, region, floor, depth=0, min_cells=6, band=0.06):
+    """Split ``region`` (bool mask) at the lowest height where it separates into >= 2 peaks.
+
+    Returns ("mass", mask, top) for the part joining the peaks (walls) and ("peak", mask, top)
+    for every tower, recursively. The split level is raised by ``band`` above where the peaks
+    first separate, so the noisy top of a wall stays with the wall instead of becoming a
+    second, sliver-thin wall level inside a tower.
+    """
+    peak = float(np.percentile(H[region], 97))
+    if depth < 4:
+        for t in np.arange(floor + 0.03, peak - 0.03, 0.025):
+            subs = _peaks_above(H, region, t, min_cells)
+            if len(subs) < 2:
+                continue
+            higher = _peaks_above(H, region, t + band, min_cells)
+            if len(higher) >= len(subs):
+                subs, t = higher, t + band
+            towers = np.any(subs, axis=0)
+            mass = region & ~towers
+            top = float(np.median(H[mass])) if mass.any() else float(t)
+            out = [("mass", mass, min(top, float(t)))]
+            for m in subs:
+                out += _skyline_elements(H, m, float(t), depth + 1, min_cells, band)
+            return out
+    return [("peak", region, peak)]
+
+
+def skyline_components(obj, lo, hi, p, materials) -> Tuple[List[dict], dict]:
+    """Towers, wall blocks, roofs and battlements (normalised components) from the scan's roofline."""
+    grid = int(p.get("skyline_grid", 64))
+    size = hi - lo
+    H = height_map(obj, lo, hi, grid)
+    footprint = H > 0.03
+    labels, sizes = _components(footprint, connectivity4=False)
+    if len(sizes) > 1:  # main building only; stray blobs are scan noise
+        footprint = labels == int(np.argmax(sizes[1:]) + 1)
+    cell = size[:2] / grid  # metres per cell (x, y)
+    min_cells = max(6, int(0.015 * footprint.sum()))
+    elements = _skyline_elements(H, footprint, 0.0, min_cells=min_cells)
+    stone = next((n for n in ("stone", "wall") if n in materials), p.get("default_material", ""))
+    roof_mat = "roof" if "roof" in materials else stone
+    merlon_h = min(1.8, 0.1 * float(size[2]))  # metres
+    battlements = bool(p.get("battlements", True))
+    comps, info = [], {"towers": 0, "wall_blocks": 0, "roofs": 0, "grid": grid}
+
+    def norm_xy(col, row):
+        return (col / grid, row / grid)
+
+    def sink():
+        # Every element reaches a little (and differently far) below the ground, and merlons sink
+        # into what they stand on: exact booleans fail on coplanar faces. The final cut flattens it.
+        return -0.01 - 0.0007 * len(comps)
+
+    def box(name, c0, r0, c1, r1, z0, z1, material, **kw):
+        z0 = sink() if z0 <= 0 else z0
+        comps.append(dict(name=name, type="box", min=[c0 / grid, r0 / grid, z0], max=[c1 / grid, r1 / grid, z1],
+                          axis="Z", refine=False, material=material, **kw))
+
+    def wall_merlons(c0, r0, c1, r1, z):
+        """Merlon rows on the long sides of a wall block's top."""
+        mz = merlon_h / float(size[2])
+        lx, ly = (c1 - c0) * cell[0], (r1 - r0) * cell[1]
+        along_x = lx >= ly
+        length = lx if along_x else ly
+        n = int(min(24, max(3, round(length / 2.4))))
+        d = 0.6 / float(cell[1] if along_x else cell[0])  # 0.6 m parapet depth, in cells
+        # stand 8 cm proud of the wall face and stop short of its ends: no coplanar faces
+        ex, ey = 0.08 / float(cell[0]), 0.08 / float(cell[1])
+        if along_x:
+            for rr0, rr1 in ((r0 - ey, r0 + d), (r1 - d, r1 + ey)):
+                box("merlon", c0 + ex, rr0, c1 - ex, rr1, z - 0.3 * mz, z + mz, stone, array_count=n, array_axis="X")
+        else:
+            for cc0, cc1 in ((c0 - ex, c0 + d), (c1 - d, c1 + ex)):
+                box("merlon", cc0, r0 + ey, cc1, r1 - ey, z - 0.3 * mz, z + mz, stone, array_count=n, array_axis="Y")
+
+    for kind, region, top in elements[:24]:
+        rows, cols = np.nonzero(region)
+        r0, r1, c0, c1 = rows.min(), rows.max() + 1, cols.min(), cols.max() + 1
+        ex, ey = (c1 - c0) * cell[0], (r1 - r0) * cell[1]
+        fill = region.sum() / float((r1 - r0) * (c1 - c0))
+        if kind == "mass":
+            # walls reach one cell into the towers they join, so the union closes cleanly
+            grown = region | (_dilate(region, 1) & footprint)
+            rows, cols = np.nonzero(grown)
+            r0, r1, c0, c1 = rows.min(), rows.max() + 1, cols.min(), cols.max() + 1
+            for rr0, cc0, rr1, cc1 in rectangle_cover(grown[r0:r1, c0:c1], min_cells=min_cells):
+                box("wall", c0 + cc0, r0 + rr0, c0 + cc1 + 1, r0 + rr1 + 1, 0.0, top, stone)
+                info["wall_blocks"] += 1
+                if battlements:
+                    wall_merlons(c0 + cc0, r0 + rr0, c0 + cc1 + 1, r0 + rr1 + 1, top)
+            continue
+        info["towers"] += 1
+        round_ = 0.55 <= fill <= 0.9 and 0.65 <= ex / max(ey, 1e-9) <= 1.55
+        cy, cx = rows.mean() + 0.5, cols.mean() + 0.5
+        if round_:
+            radius = math.sqrt(region.sum() * cell[0] * cell[1] / math.pi)  # metres
+            hx, hy = radius / cell[0], radius / cell[1]  # half extents in cells
+            b0, b1 = (cx - hx, cy - hy), (cx + hx, cy + hy)
+        else:
+            radius = 0.5 * math.sqrt(ex * ey)
+            b0, b1 = (c0, r0), (c1, r1)
+        # Pointed roof when the centre clearly rises above the rim
+        dist = np.hypot((cols + 0.5 - cx) * cell[0], (rows + 0.5 - cy) * cell[1])
+        hs = H[rows, cols]
+        centre = hs[dist <= 0.35 * radius]
+        rim = hs[(dist >= 0.6 * radius)]
+        centre_h = float(np.median(centre)) if len(centre) else top
+        rim_h = float(np.median(rim)) if len(rim) else top
+        pointed = (top - rim_h) * size[2] > 0.45 * radius and centre_h > rim_h
+        name = f"tower_{info['towers']}"
+        body_type = "cylinder" if round_ else "box"
+        if pointed:
+            eave = max(rim_h, 0.15 * top)
+            comps.append(dict(name=name, type=body_type, min=[b0[0] / grid, b0[1] / grid, sink()],
+                              max=[b1[0] / grid, b1[1] / grid, eave], axis="Z", segments=32, refine=False,
+                              material=stone))
+            o = 0.06  # eaves overhang
+            wx, wy = (b1[0] - b0[0]) * o, (b1[1] - b0[1]) * o
+            comps.append(dict(name=f"{name}_roof", type="cone" if round_ else "pyramid",
+                              min=[(b0[0] - wx) / grid, (b0[1] - wy) / grid, eave - 0.004],
+                              max=[(b1[0] + wx) / grid, (b1[1] + wy) / grid, top], axis="+Z", taper=0.0,
+                              segments=32, refine=False, material=roof_mat))
+            info["roofs"] += 1
+            continue
+        mz = merlon_h / float(size[2]) if battlements else 0.0
+        comps.append(dict(name=name, type=body_type, min=[b0[0] / grid, b0[1] / grid, sink()],
+                          max=[b1[0] / grid, b1[1] / grid, top - mz], axis="Z", segments=32, refine=False,
+                          material=stone))
+        if mz:
+            if round_:
+                teeth = int(min(32, max(8, 2 * round(math.pi * 2 * radius / 4.8))))
+                gx, gy = 0.02 * (b1[0] - b0[0]), 0.02 * (b1[1] - b0[1])  # parapet slightly proud
+                comps.append(dict(name=f"{name}_merlons", type="merlon_ring",
+                                  min=[(b0[0] - gx) / grid, (b0[1] - gy) / grid, top - 1.3 * mz],
+                                  max=[(b1[0] + gx) / grid, (b1[1] + gy) / grid, top],
+                                  axis="Z", segments=teeth, thickness=min(0.35, 0.8 / max(radius, 1e-6)),
+                                  refine=False, material=stone))
+            else:
+                bx0, by0, bx1, by1 = b0[0], b0[1], b1[0], b1[1]
+                wall_merlons(bx0, by0, bx1, by1, top - mz)
+                depth_x, depth_y = 0.6 / cell[0], 0.6 / cell[1]
+                nx = int(min(24, max(3, round(ey / 2.4))))
+                for cc0, cc1 in ((bx0 - 0.08 / cell[0], bx0 + depth_x),
+                                 (bx1 - depth_x, bx1 + 0.08 / cell[0])):  # the other two sides
+                    box("merlon", cc0, by0 + depth_y, cc1, by1 - depth_y, top - 1.3 * mz, top, stone,
+                        array_count=nx, array_axis="Y")
+    info["elements"] = len(comps)
+    info["height_map_cells"] = int(footprint.sum())
+    log(f"skyline: {info['towers']} towers ({info['roofs']} roofed), {info['wall_blocks']} wall blocks")
+    return comps, info
 
 
 # ----------------------------------------------------------------- three-view blueprint
@@ -1386,6 +1639,121 @@ CLASSIFY_CANDIDATES = [
 ]
 
 
+def _expand_arrays(comps):
+    """Blender-side twin of shape_templates.expand_arrays (n teeth, n-1 equal gaps)."""
+    out = []
+    for c in comps:
+        n = int(c.get("array_count", 1))
+        if n <= 1 or c.get("type") == "merlon_ring":
+            out.append(c)
+            continue
+        axis = "XYZ".index(c.get("array_axis", "X"))
+        lo_a, hi_a = float(c["min"][axis]), float(c["max"][axis])
+        width = (hi_a - lo_a) / (2 * n - 1)
+        for k in range(n):
+            copy = dict(c, array_count=1, name=f"{c['name']}_{k + 1}", min=list(c["min"]), max=list(c["max"]))
+            copy["min"][axis] = lo_a + 2 * k * width
+            copy["max"][axis] = copy["min"][axis] + width
+            out.append(copy)
+    return out
+
+
+def _is_inside(bvh, point) -> bool:
+    """Ray parity, majority of three skewed directions (robust at edges and corners)."""
+    votes = 0
+    for d in ((0.577, 0.211, 0.789), (-0.302, 0.905, 0.299), (0.13, -0.42, -0.898)):
+        direction = mathutils.Vector(d).normalized()
+        origin, hits = mathutils.Vector(point), 0
+        for _ in range(256):
+            hit = bvh.ray_cast(origin, direction)
+            if hit[0] is None:
+                break
+            hits += 1
+            origin = hit[0] + direction * 1e-5
+        votes += hits % 2
+    return votes >= 2
+
+
+def _lost_members(obj, members, lo, size) -> int:
+    """Union members whose centre is not inside the result (an exact boolean silently dropped them)."""
+    bvh = _bvh([obj])
+    cut = [(lo + np.array(c["min"]) * size, lo + np.array(c["max"]) * size) for c in members
+           if c.get("operation") == "subtract"]
+    lost = 0
+    for c in members:
+        if c.get("operation", "union") != "union" or c.get("type") in ("torus", "merlon_ring"):
+            continue  # rings have no material at their centre
+        centre = lo + (np.array(c["min"]) + np.array(c["max"])) / 2.0 * size
+        if any(np.all(centre >= a) and np.all(centre <= b) for a, b in cut):
+            continue
+        if not _is_inside(bvh, centre):
+            lost += 1
+    return lost
+
+
+def _cut_below(obj, lo, size, z):
+    ground = region_box("ground", lo - size, np.array([lo[0] + 2 * size[0], lo[1] + 2 * size[1], z]))
+    boolean(obj, ground, "DIFFERENCE")
+    bpy.data.objects.remove(ground, do_unlink=True)
+
+
+def build_component_groups(comps, lo, size, slots, p, report, ground_z=None):
+    """Build the body ("" part) and one object per part name; every group ends watertight.
+
+    ``ground_z``: components reaching below it (skyline layouts sink them to avoid coplanar
+    bottoms) are cut flat there.
+    """
+    groups = {}
+    for c in comps:
+        groups.setdefault(c.get("part") or "", []).append(c)
+    built = {}
+    for part_name, members in groups.items():
+        unions = [component_object(c, lo, size, slots) for c in members if c.get("operation", "union") == "union"]
+        cutters = [component_object(c, lo, size, slots) for c in members if c.get("operation") == "subtract"]
+        if not unions:
+            for o in cutters:
+                bpy.data.objects.remove(o, do_unlink=True)
+            continue
+        use_boolean = p.get("union", True)
+        try:
+            obj = union_objects(unions, use_boolean)
+        except RuntimeError as exc:
+            log(f"primitives: {exc}; joining without boolean")
+            obj = union_objects([o for o in unions if _alive(o)], False)
+            use_boolean = False
+        subtract_objects(obj, cutters)  # openings: doors, arches, crenels
+        lost = _lost_members(obj, members, lo, size) if use_boolean else 0
+        if lost:
+            log(f"primitives: union dropped {lost} component(s) of '{part_name or 'body'}'")
+        broken = bool(repair_manifold(obj)["open_edges_after"] or lost)
+        if ground_z is not None and not broken:  # booleans need a closed mesh: repair first, then cut
+            _cut_below(obj, lo, size, ground_z)
+            broken = bool(repair_manifold(obj)["open_edges_after"])
+        if broken and use_boolean:
+            # Coplanar unions can leave open seams: rebuild as cut, separately closed shells instead
+            log(f"primitives: group '{part_name or 'body'}' broken after union; rebuilding as shells")
+            bpy.data.objects.remove(obj, do_unlink=True)
+            shells = [component_object(c, lo, size, slots) for c in members if c.get("operation", "union") == "union"]
+            cutters = [component_object(c, lo, size, slots) for c in members if c.get("operation") == "subtract"]
+            for shell in shells:
+                for cutter in cutters:
+                    boolean(shell, cutter, "DIFFERENCE")
+                if ground_z is not None:
+                    _cut_below(shell, lo, size, ground_z)
+                repair_manifold(shell)
+            for cutter in cutters:
+                bpy.data.objects.remove(cutter, do_unlink=True)
+            obj = union_objects(shells, False)
+            report.setdefault("rebuilt_as_shells", []).append(part_name or "body")
+        built[part_name] = obj
+
+    if "" not in built:
+        for o in built.values():
+            bpy.data.objects.remove(o, do_unlink=True)
+        raise RuntimeError("recipe has no body components")
+    return built
+
+
 def op_primitives(p: dict) -> dict:
     """Replace the cleaned scan with a primitive composite when it fits.
 
@@ -1412,7 +1780,11 @@ def op_primitives(p: dict) -> dict:
 
     comps = [dict(c) for c in p.get("components") or []]
     report = {"mode": p.get("mode", "auto")}
-    if comps:
+    if p.get("layout") == "skyline":
+        comps, report["skyline"] = skyline_components(target, lo, hi, p, materials)
+        report["source"] = "skyline"
+        limit = float(p.get("skyline_max_error", 0.1))
+    elif comps:
         if p.get("refine", True):
             refine_components(comps, (world_coords(scan) - lo) / size)
         report["source"] = "recipe"
@@ -1439,64 +1811,39 @@ def op_primitives(p: dict) -> dict:
             comps, report["source"] = [], "blueprint"  # no clean single shape: try the blueprint hull
             limit = float(p.get("blueprint_max_error", 0.05))
 
-    if report["source"] == "blueprint":
-        hull, info = build_blueprint(scan, lo, hi, int(p.get("blueprint_resolution", 256)), rng)
-        report["blueprint"] = info
-        built = {"": hull}
-        if materials:
-            hull.data.materials.append(slots[p.get("default_material") or next(iter(materials))])
-    else:
-        built = None
+    def build(comps):
+        if report["source"] == "blueprint":
+            hull, info = build_blueprint(scan, lo, hi, int(p.get("blueprint_resolution", 256)), rng)
+            report["blueprint"] = info
+            if materials:
+                hull.data.materials.append(slots[p.get("default_material") or next(iter(materials))])
+            return {"": hull}
+        return build_component_groups(_expand_arrays(comps), lo, size, slots, p, report,
+                                      ground_z=float(lo[2]) if report["source"].startswith("skyline") else None)
 
-    # Build groups: body ("" part) and one group per part name
-    groups = {}
-    for c in comps:
-        groups.setdefault(c.get("part") or "", []).append(c)
-    built = built if built is not None else {}
-    for part_name, members in groups.items():
-        unions = [component_object(c, lo, size, slots) for c in members if c.get("operation", "union") == "union"]
-        cutters = [component_object(c, lo, size, slots) for c in members if c.get("operation") == "subtract"]
-        if not unions:
-            for o in cutters:
-                bpy.data.objects.remove(o, do_unlink=True)
-            continue
-        use_boolean = p.get("union", True)
-        try:
-            obj = union_objects(unions, use_boolean)
-        except RuntimeError as exc:
-            log(f"primitives: {exc}; joining without boolean")
-            obj = union_objects([o for o in unions if _alive(o)], False)
-            use_boolean = False
-        subtract_objects(obj, cutters)  # openings: doors, arches, crenels
-        if repair_manifold(obj)["open_edges_after"] and use_boolean:
-            # Coplanar unions can leave open seams: rebuild as cut, separately closed shells instead
-            log(f"primitives: group '{part_name or 'body'}' not watertight after union; rebuilding as shells")
-            bpy.data.objects.remove(obj, do_unlink=True)
-            shells = [component_object(c, lo, size, slots) for c in members if c.get("operation", "union") == "union"]
-            cutters = [component_object(c, lo, size, slots) for c in members if c.get("operation") == "subtract"]
-            for shell in shells:
-                for cutter in cutters:
-                    boolean(shell, cutter, "DIFFERENCE")
-                repair_manifold(shell)
-            for cutter in cutters:
-                bpy.data.objects.remove(cutter, do_unlink=True)
-            obj = union_objects(shells, False)
-            report.setdefault("rebuilt_as_shells", []).append(part_name or "body")
-        built[part_name] = obj
-
-    if "" not in built:
-        for o in built.values():
-            bpy.data.objects.remove(o, do_unlink=True)
-        raise RuntimeError("recipe has no body components")
+    built = build(comps)
     shape_objs = list(built.values())
     fit = fit_error(shape_objs, scan_pts, scan_bvh, diag, rng)
+    use = p.get("mode", "auto") == "primitives" or fit["error"] <= limit
+    log(f"primitives: {report['source']} fit error {fit['error']:.4f} (limit {limit}) -> "
+        f"{'using primitives' if use else 'rejected'}")
+    if not use and report["source"] == "recipe" and p.get("skyline_fallback"):
+        # A building that doesn't match its recipe (a gatehouse with three towers): read its layout instead
+        report["recipe_fit_error"] = fit["error"]
+        for o in shape_objs:
+            bpy.data.objects.remove(o, do_unlink=True)
+        comps, report["skyline"] = skyline_components(target, lo, hi, p, materials)
+        report["source"], limit = "skyline (recipe rejected)", float(p.get("skyline_max_error", 0.1))
+        built = build(comps)
+        shape_objs = list(built.values())
+        fit = fit_error(shape_objs, scan_pts, scan_bvh, diag, rng)
+        use = fit["error"] <= limit
+        log(f"primitives: skyline fit error {fit['error']:.4f} (limit {limit})")
     report.update(fit_error=fit["error"], fit_p95_m=fit["p95_m"],
                   cage_hint=round(min(0.15, 1.5 * fit["p95_m"] / float(size.max())), 4))
-    use = p.get("mode", "auto") == "primitives" or fit["error"] <= limit
     report["used"] = bool(use)
-    log(f"primitives: {report['source']} fit error {fit['error']:.4f} (limit {limit}) -> "
-        f"{'using primitives' if use else 'keeping scan mesh'}")
     if not use:
+        log("primitives: keeping scan mesh")
         for o in shape_objs:
             bpy.data.objects.remove(o, do_unlink=True)
         return report
@@ -2012,7 +2359,8 @@ def _bilinear(img, u, v):
     return (a * (1 - fx) + b * fx) * (1 - fy) + (c * (1 - fx) + d * fx) * fy
 
 
-def _project_pass(P, N, candidates, cam, ref, bvh, mirror_axis=None, min_facing=0.15, full_facing=0.55):
+def _project_pass(P, N, candidates, cam, ref, bvh, mirror_axis=None, min_facing=0.15, full_facing=0.55,
+                  scan_bvh=None, scan_tol=0.0):
     """One projection pass over ``candidates`` (bool mask). Returns (rows, cols, weights, rgb).
 
     With ``mirror_axis`` each texel samples the image at its mirror position across that
@@ -2045,24 +2393,42 @@ def _project_pass(P, N, candidates, cam, ref, bvh, mirror_axis=None, min_facing=
         origin = mathutils.Vector(pts[i] + nrm[i] * eps)
         if bvh.ray_cast(origin, mathutils.Vector(dirs[i]), float(dist[i]) - 2 * eps)[0] is not None:
             ok[i] = False
+        elif scan_bvh is not None and dist[i] > scan_tol:
+            # The photo shows whatever the *real* object has in front of this texel. If the scan
+            # has surface well in front of the template (a roof the template lacks), that pixel
+            # is not this face's colour.
+            far = mathutils.Vector(pts[i] + dirs[i] * scan_tol)
+            if scan_bvh.ray_cast(far, mathutils.Vector(dirs[i]), float(dist[i]) - scan_tol)[0] is not None:
+                ok[i] = False
     w = np.clip((facing - min_facing) / (full_facing - min_facing), 0.0, 1.0) * np.clip((sample[:, 3] - 0.5) * 2, 0, 1)
     w = np.where(ok, w * w * (3 - 2 * w), 0.0)  # smoothstep into the baked colours at grazing angles
     keep = w > 0
     return idx[keep, 0], idx[keep, 1], w[keep], sample[keep, :3]
 
 
-def project_reference(objs, albedo, ref, cam, res, bake_all, mirror_axes=()):
+def project_reference(objs, albedo, ref, cam, res, bake_all, mirror_axes=(), P=None, N=None, scan=None,
+                      scan_tol=0.0, ids=None, palette=None):
     """Overwrite albedo texels the camera sees (then mirrored fills) with the reference colours."""
-    P = _bake_float(objs, "position", res, "Position", bake_all)
-    N = _bake_float(objs, "normal", res, "Normal", bake_all)
+    P = _bake_float(objs, "position", res, "Position", bake_all) if P is None else P
+    N = _bake_float(objs, "normal", res, "Normal", bake_all) if N is None else N
     covered = np.linalg.norm(N, axis=-1) > 0.5
     bvh = _bvh(objs)
+    scan_bvh = _bvh([scan]) if scan is not None and scan_tol > 0 else None
     base = image_to_array(albedo)  # baked maps and the albedo share Blender's bottom-up row order
     weight = np.zeros((res, res))
     passes = {}
     for axis in (None, *mirror_axes):
         todo = covered & (weight < 0.5)
-        rows, cols, w, rgb = _project_pass(P, N, todo, cam, ref, bvh, axis)
+        rows, cols, w, rgb = _project_pass(P, N, todo, cam, ref, bvh, axis, scan_bvh=scan_bvh, scan_tol=scan_tol)
+        if ids is not None and palette is not None and len(palette) > 1 and len(rows):
+            # Template faces know their material: a stone wall must not take a red roof pixel
+            # (a turret the template doesn't have, seen in front of the wall)
+            d = ((_colour_features(rgb)[:, None, :] - _colour_features(palette)[None, :, :]) ** 2).sum(-1)
+            own = ids[rows, cols]
+            known = own >= 0
+            d_own = np.where(known, d[np.arange(len(own)), np.maximum(own, 0)], 0.0)
+            d_other = np.where(np.eye(len(palette), dtype=bool)[np.maximum(own, 0)], np.inf, d).min(axis=1)
+            w = np.where(known & (d_own > 0.01) & (d_other < 0.5 * d_own), 0.0, w)
         if axis is not None:
             w = w * 0.85  # mirrored detail is a guess; let a little of the baked colour through
         base[rows, cols, :3] = base[rows, cols, :3] * (1 - w[:, None]) + rgb * w[:, None]
@@ -2072,7 +2438,7 @@ def project_reference(objs, albedo, ref, cam, res, bake_all, mirror_axes=()):
     reliable = weight > 0.5
     return {"passes": passes, "covered_texels": int(covered.sum()),
             "projected_fraction": round(float(reliable.sum()) / max(1, int(covered.sum())), 3),
-            "_reliable": reliable}
+            "_reliable": reliable, "_weight": weight}
 
 
 def _shift(a, dy, dx):
@@ -2123,6 +2489,199 @@ def fill_unbaked(objs, albedo, res, bake_all, keep=None, fallback_rgb=(0.5, 0.5,
     arr[..., :3] = rgb
     array_to_image(albedo, arr)
     return round(fraction, 4)
+
+
+# ----------------------------------------------------------------- material tiles
+#
+# A single reference image only shows one side. Template faces it never saw (backs, roofs, the
+# far side of a tower) used to keep the reconstruction's colour guess, which is dark and smeared.
+# Instead every template material gets a tiling texture, mapped triplanar in metres so bricks
+# keep a constant real-world size: a patch cut from the reference image where that material is
+# visible (de-lit and made seamless), else a procedural pattern in the material's colour.
+
+def _box_blur(img, r):
+    """Separable box blur with wrap-around (tiles are periodic)."""
+    out = img.astype(np.float64)
+    for axis in (0, 1):
+        acc = np.zeros_like(out)
+        for k in range(-r, r + 1):
+            acc += np.roll(out, k, axis=axis)
+        out = acc / (2 * r + 1)
+    return out
+
+
+def _resize(img, n):
+    """Bilinear resize of an (H, W, C) array to (n, n, C)."""
+    h, w = img.shape[:2]
+    ys, xs = np.meshgrid((np.arange(n) + 0.5) / n, (np.arange(n) + 0.5) / n, indexing="ij")
+    return _bilinear(img, xs.ravel(), ys.ravel()).reshape(n, n, -1)
+
+
+def make_seamless(tile):
+    """Cross-fade the tile with its half-offset copy so opposite edges match."""
+    n = tile.shape[0]
+    shifted = np.roll(np.roll(tile, n // 2, axis=0), n // 2, axis=1)
+    ramp = 1.0 - np.abs(np.linspace(-1.0, 1.0, n))  # 1 in the middle, 0 at the edges
+    w = np.minimum.outer(ramp, ramp)[..., None] ** 0.5
+    return tile * w + shifted * (1.0 - w)
+
+
+def _value_noise(n, cells, rng):
+    """Periodic value noise in [0, 1] on an (n, n) grid."""
+    g = rng.random((cells, cells))
+    ys, xs = np.meshgrid(np.arange(n) * cells / n, np.arange(n) * cells / n, indexing="ij")
+    x0, y0 = xs.astype(int), ys.astype(int)
+    fx, fy = xs - x0, ys - y0
+    fx, fy = fx * fx * (3 - 2 * fx), fy * fy * (3 - 2 * fy)
+    x1, y1 = (x0 + 1) % cells, (y0 + 1) % cells
+    a, b, c, d = g[y0, x0], g[y0, x1], g[y1, x0], g[y1, x1]
+    return (a * (1 - fx) + b * fx) * (1 - fy) + (c * (1 - fx) + d * fx) * fy
+
+
+def procedural_tile(name, rgb, n=256, seed=0):
+    """(tile, metres) - seamless stone blocks / roof shingles / planks / grain in colour ``rgb`` (sRGB)."""
+    rng = np.random.default_rng(seed)
+    key = name.lower()
+    noise = 0.7 * _value_noise(n, 32, rng) + 0.3 * _value_noise(n, 8, rng)
+    shade = np.ones((n, n))
+    ys, xs = np.mgrid[0:n, 0:n]
+    if any(k in key for k in ("stone", "brick", "wall", "rock", "masonry")):
+        rows, cols, metres = 8, 4, 2.4  # 0.6 x 0.3 m ashlar blocks
+        row = ys * rows // n
+        off = np.where(row % 2, n // (2 * cols), 0)
+        col = ((xs + off) % n) * cols // n
+        block = rng.normal(1.0, 0.07, (rows, cols))[row, col]
+        mortar = ((ys % (n // rows)) < 2) | (((xs + off) % (n // cols)) < 2)
+        shade = np.where(mortar, 0.72, block)
+    elif any(k in key for k in ("roof", "shingle", "slate", "tile")):
+        rows, cols, metres = 16, 12, 1.6
+        row = ys * rows // n
+        off = np.where(row % 2, n // (2 * cols), 0)
+        col = ((xs + off) % n) * cols // n
+        within = (ys % (n // rows)) / float(n // rows)
+        shade = rng.normal(1.0, 0.06, (rows, cols))[row, col] * (0.78 + 0.22 * within)
+    elif any(k in key for k in ("wood", "plank", "timber")):
+        planks, metres = 6, 1.2
+        plank = xs * planks // n
+        grain = 0.94 + 0.06 * np.sin(2 * np.pi * (ys / n * 3 + 0.4 * _value_noise(n, 6, rng)) * 4)
+        shade = rng.normal(1.0, 0.06, planks)[plank] * grain * np.where((xs % (n // planks)) < 2, 0.7, 1.0)
+    else:
+        metres = 1.0
+    shade = shade * (0.95 + 0.1 * noise)
+    tile = np.clip(np.asarray(rgb, float)[None, None, :3] * shade[..., None], 0.0, 1.0)
+    return tile, metres
+
+
+TILE_METRES = (("stone", 2.4), ("brick", 2.4), ("wall", 2.4), ("rock", 2.4), ("roof", 1.6), ("shingle", 1.6),
+               ("slate", 1.6), ("tile", 1.6), ("wood", 1.2), ("plank", 1.2))
+
+
+def reference_patch(ref, cam, pts, name="", n=256, asset_size=1.0):
+    """(tile, metres) - a real-world-sized, uniform square of the reference image showing one material.
+
+    ``pts`` are world positions of texels of that material the camera saw well. Among the
+    windows lying wholly on that material, the one with the least large-scale variation (no
+    window, door or shadow edge) closest to the material's typical colour is cut out.
+    Returns (None, 0) when the material shows too small in the image.
+    """
+    if len(pts) < 200:
+        return None, 0.0
+    G = 96
+    u, v, z = project_to_image(pts, cam)
+    ok = (u > 0) & (u < 1) & (v > 0) & (v < 1)
+    if ok.sum() < 200:
+        return None, 0.0
+    H, W = ref.shape[:2]
+    mask = np.zeros((G, G), bool)
+    mask[(v[ok] * G).astype(int), (u[ok] * G).astype(int)] = True
+    mask = _erode(_dilate(mask, 1), 1)  # close the gaps between projected texels
+    depth = float(np.median(z[ok]))
+    metres_per_px = depth * 2.0 * math.tan(math.radians(cam["fov_deg"]) / 2.0) / W
+    want_m = next((m for k, m in TILE_METRES if k in name.lower()), 1.0)
+    want_m = min(want_m, max(0.25, 0.6 * asset_size))
+    size = int(round(want_m / metres_per_px * G / W))
+    size = min(max(size, 6), G // 3)
+    cells = _resize(ref[..., :3], G)
+    integ = lambda a: np.pad(a.cumsum(0).cumsum(1), ((1, 0), (1, 0)) + ((0, 0),) * (a.ndim - 2))  # noqa: E731
+    box = lambda I: I[size:, size:] - I[:-size, size:] - I[size:, :-size] + I[:-size, :-size]  # noqa: E731
+    while size >= 6:
+        fill = box(integ(mask.astype(np.float64)))
+        hits = np.argwhere(fill >= 0.97 * size * size)
+        if len(hits):
+            break
+        size -= 2
+    else:
+        return None, 0.0
+    area = float(size * size)
+    mean = box(integ(cells)) / area
+    var = (box(integ(cells ** 2)) / area - mean ** 2).sum(axis=-1)
+    typical = np.median(cells[mask], axis=0)
+    score = var[hits[:, 0], hits[:, 1]] + 0.5 * ((mean[hits[:, 0], hits[:, 1]] - typical) ** 2).sum(axis=-1)
+    r0, c0 = hits[int(np.argmin(score))]
+    y0, y1 = int(r0 * H / G), int((r0 + size) * H / G)
+    x0, x1 = int(c0 * W / G), int((c0 + size) * W / G)
+    patch = _resize(ref[y0:y1, x0:x1, :3], n)
+    # De-light: remove the photo's shading gradient (one lit side of a tower), keep the detail
+    low = _box_blur(patch, max(2, n // 10))
+    patch = np.clip(patch / np.maximum(low, 1e-3) * low.mean(axis=(0, 1)), 0.0, 1.0)
+    return make_seamless(patch), (x1 - x0) * metres_per_px
+
+
+def _sample_wrap(tile, a, b):
+    return _bilinear(tile, np.mod(a, 1.0), np.mod(b, 1.0))
+
+
+def triplanar(tile, metres, P, N):
+    """Sample a tile at world positions/normals (N, 3) with triplanar blending."""
+    w = np.abs(N) ** 4
+    w /= np.maximum(w.sum(axis=1, keepdims=True), 1e-9)
+    q = P / max(metres, 1e-6)
+    out = _sample_wrap(tile, q[:, 1], -q[:, 2]) * w[:, :1]   # X-facing: (y, z), z up
+    out += _sample_wrap(tile, q[:, 0], -q[:, 2]) * w[:, 1:2]  # Y-facing: (x, z)
+    out += _sample_wrap(tile, q[:, 0], q[:, 1]) * w[:, 2:3]   # Z-facing: (x, y)
+    return out
+
+
+def apply_material_tiles(albedo, P, N, ids, materials, baked, weight, ref=None, cam=None, asset_size=1.0,
+                         surface_m2=1.0, trust_baked=False):
+    """Give every unseen template texel its material's tiling texture (see the section comment).
+
+    ``trust_baked``: the reconstruction carried real colours, so its guess may set a tile's colour
+    when the camera never saw that material; otherwise the spec palette does.
+    """
+    arr = image_to_array(albedo)
+    covered = np.linalg.norm(N, axis=-1) > 0.5
+    texel_m = math.sqrt(surface_m2 / max(1, int(covered.sum())))  # texture resolution in metres
+    weight = np.zeros(covered.shape) if weight is None else weight
+    report = {}
+    for i, m in enumerate(materials):
+        texels = covered & (ids == i)
+        if texels.sum() < 16:
+            continue
+        seen = texels & (weight > 0.6)
+        tile, metres, source = None, 0.0, "procedural"
+        if ref is not None and cam is not None:
+            tile, metres = reference_patch(ref, cam, P[seen], m["name"], asset_size=asset_size)
+            source = "reference" if tile is not None else source
+        if tile is None:
+            # Colour: what the camera saw > the reconstruction's (non-black) guess > the spec palette
+            rgb = arr[seen][:, :3] if seen.sum() > 50 else (baked[texels][:, :3] if trust_baked else arr[:0, 0, :3])
+            lum = rgb @ np.array([0.2126, 0.7152, 0.0722])
+            rgb = rgb[lum > 0.08]
+            colour = np.median(rgb, axis=0) if len(rgb) > 50 else srgb_from_linear(m["base_color"])
+            tile, metres = procedural_tile(m["name"], colour, seed=i)
+        metres = min(metres, max(0.25, 0.6 * asset_size))  # small props: several repeats, not one
+        # never finer than the texture can hold: a 0.3 m block row needs a few texels or it aliases
+        metres = max(metres, 48 * texel_m if source == "procedural" else 24 * texel_m)
+        rows, cols = np.nonzero(texels)
+        t = triplanar(tile, metres, P[rows, cols], N[rows, cols])
+        keep = weight[rows, cols][:, None]
+        # projected detail stays where the camera saw the surface; the tile replaces the guess elsewhere
+        arr[rows, cols, :3] = arr[rows, cols, :3] + (t - baked[rows, cols, :3]) * (1.0 - keep)
+        report[m["name"]] = {"source": source, "tile_m": round(float(metres), 3),
+                             "unseen_fraction": round(float(1.0 - keep.mean()), 3)}
+    array_to_image(albedo, arr)
+    return report
 
 
 def resolve_camera(p, scene):
@@ -2198,7 +2757,14 @@ def op_texture(p: dict) -> dict:
 
     # --- Sharp detail: re-project the reference image the 3D model was reconstructed from
     ref_path = p.get("reference_image")
-    reliable = None
+    reliable, weight, ref, cam = None, None, None, None
+    tiles = material_ids is not None and p.get("unseen_fill", "tiles") == "tiles"
+    baked = image_to_array(albedo).copy() if tiles else None
+    P = N = None
+    if tiles or (p.get("project_reference", True) and ref_path):
+        bake_plain = lambda img, t: bake_all(img, t, from_high=False)  # noqa: E731
+        P = _bake_float(objs, "position", res, "Position", bake_plain)
+        N = _bake_float(objs, "normal", res, "Normal", bake_plain)
     if p.get("project_reference", True) and ref_path and Path(ref_path).is_file():
         prior = resolve_camera(p, scene)
         if prior is None:
@@ -2213,15 +2779,30 @@ def op_texture(p: dict) -> dict:
                 t0 = time.time()
                 proj.update(project_reference(objs, albedo, ref, cam, res,
                                               lambda img, t: bake_all(img, t, from_high=False),
-                                              mirror_axes=tuple(p.get("mirror_axes") or ())))
+                                              mirror_axes=tuple(p.get("mirror_axes") or ()), P=P, N=N,
+                                              # templates: only where the scan agrees there is surface
+                                              scan=high if material_ids is not None else None,
+                                              scan_tol=max(0.03 * size, 2.0 * cage), ids=material_ids,
+                                              palette=np.array([srgb_from_linear(m["base_color"])
+                                                                for m in materials])))
                 proj["seconds"] = round(time.time() - t0, 1)
+                weight = proj.pop("_weight", None)
                 mask = proj.pop("_reliable", None)
                 if mask is not None and proj["projected_fraction"] >= 0.15:
                     reliable = mask
             else:
                 proj["skipped"] = "silhouette does not match the reference image"
+                ref, cam = None, None  # the camera is wrong, so are patches cut through it
             report["projection"] = proj
             log(f"projection: IoU {iou:.3f}, {proj.get('projected_fraction', 0)} of texels")
+
+    # --- Faces the camera never saw: tiling texture per template material instead of the guess
+    if tiles:
+        area = sum(sum(poly.area for poly in o.data.polygons) for o in objs)
+        report["material_tiles"] = apply_material_tiles(
+            albedo, P, N, material_ids, materials, baked, weight, ref, cam, asset_size=size, surface_m2=area,
+            trust_baked=str(report.get("albedo", "")).startswith(("color_attribute", "material")))
+        log(f"material tiles: {report['material_tiles']}")
 
     # --- Black texels the bake never reached (QA BUG-13): measure, then fill from neighbours
     report["unbaked_fraction"] = fill_unbaked(
