@@ -450,5 +450,8 @@ asset_pipeline/
   doctor.py                     environment diagnostics
 mcp_server.py                   MCP tools for Claude Code / Codex / OpenCode
 configs/rtx4090.yaml            tuned settings for a 24 GB RTX 4090
+scripts/inspect_export.py       (in Blender) what an engine sees in an exported GLB/FBX/OBJ
+scripts/collect_results.py      bundle runs into a QA results summary + zip
+docs/QA_TEST_PROMPT.md          brief for an AI/human tester to install, run and audit the pipeline
 tests/                          unit tests + real-Blender integration tests (fixtures: mannequin, gun)
 ```
