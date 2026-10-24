@@ -43,16 +43,18 @@ sys.path.insert(0, str(ROOT))
 
 from asset_pipeline import config as config_module  # noqa: E402
 from asset_pipeline.config import Config, _apply_mapping, find_blender, load_config  # noqa: E402
+from asset_pipeline import nvidia_api  # noqa: E402
 from asset_pipeline.llm_client import PRESETS, LLMClient  # noqa: E402
 
 # Choices for string settings (anything else is free text)
 OPTIONS: Dict[str, List[str]] = {
-    "llm.provider": ["lmstudio", "ollama", "openai_compatible", "vllm", "deepseek", "openrouter", "gemini", "openai",
+    "llm.provider": ["lmstudio", "ollama", "nvidia", "openai_compatible", "vllm", "deepseek", "openrouter", "gemini",
+                     "openai",
                      "anthropic", "cli"],
-    "diffusion.backend": ["diffusers", "comfyui"],
+    "diffusion.backend": ["diffusers", "comfyui", "nvidia"],
     "diffusion.pipeline_type": ["auto", "sdxl", "flux", "sd"],
     "preprocess.rembg_model": ["isnet-general-use", "u2net", "birefnet-general"],
-    "reconstruction.backend": ["triposr", "instantmesh", "openlrm", "command", "primitive"],
+    "reconstruction.backend": ["triposr", "instantmesh", "openlrm", "command", "nvidia", "primitive"],
     "reconstruction.device": ["cuda:0", "cuda:1", "cpu"],
     "cleanup.remesh_mode": ["quadriflow", "voxel", "voxel_shrinkwrap", "decimate", "none"],
     "shapes.mode": ["auto", "primitives", "mesh"],
@@ -193,6 +195,11 @@ def list_models(provider: str, base_url: str, api_key: str = "") -> Dict[str, An
         base_url = f"{base}/v1"
     if provider in ("anthropic", "cli"):
         return {"models": [], "note": "this provider does not list models; type the model name"}
+    if provider == "nvidia":  # public catalog; vision flag from the model name
+        skip = re.compile(r"embed|guard|reward|safety|parse|clip|translate|detector|retriever|calibration|coder|code",
+                          re.I)
+        return {"base_url": nvidia_api.CHAT_URL, "models": [
+            {"id": m, "vision": nvidia_api.is_vision_model(m)} for m in nvidia_api.catalog() if not skip.search(m)]}
     url = base_url.rstrip("/")
     url = url if url.endswith(("/v1", "/openai")) or provider in PRESETS else f"{url}/v1"
     if provider == "openai" and not base_url:
@@ -484,6 +491,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"config_path": str(app.config_path), "schema": schema(cfg),
                                    "output_dir": str(output_dir(cfg).resolve()),
                                    "presets": {k: v[0] for k, v in PRESETS.items()}, "key_envs": KEY_ENVS,
+                                   "nvidia": {"key_url": nvidia_api.KEY_URL, "planner": nvidia_api.DEFAULT_PLANNER,
+                                              "vision": nvidia_api.DEFAULT_VISION, "image": nvidia_api.DEFAULT_IMAGE,
+                                              "model3d": nvidia_api.DEFAULT_3D,
+                                              "key_set": bool(app.keys.get(nvidia_api.KEY_ENV)
+                                                              or os.environ.get(nvidia_api.KEY_ENV))},
                                    "session_keys": sorted(app.keys)})
             if url.path == "/api/models":
                 provider = q.get("provider", "")
@@ -547,6 +559,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"session_keys": sorted(app.keys)})
             if url.path == "/api/ping":
                 return self._json(app.ping(body.get("section", "llm"), body.get("values") or {}, body.get("chat")))
+            if url.path == "/api/nvidia/test_image":
+                return self._json(app.nvidia_test_image(body.get("values") or {}))
             if url.path == "/api/upload":
                 return self._json(app.upload(body.get("name", "image.png"), body.get("data", "")))
             if url.path == "/api/jobs":
@@ -598,6 +612,32 @@ class App:
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(raw)
         return {"path": str(dest), "rel": _rel(dest, self.out_dir())}
+
+    def nvidia_test_image(self, values: Dict[str, Any]) -> Dict[str, Any]:
+        """Generate one small test picture with the NVIDIA image model on screen."""
+        import io
+
+        from asset_pipeline.reference_generator import NvidiaImageBackend
+
+        cfg = validated({"diffusion": values}).diffusion
+        with self._env_lock:
+            saved = os.environ.get(nvidia_api.KEY_ENV)
+            if self.keys.get(nvidia_api.KEY_ENV):
+                os.environ[nvidia_api.KEY_ENV] = self.keys[nvidia_api.KEY_ENV]
+            try:
+                t0 = time.time()
+                img = NvidiaImageBackend(cfg).generate("a wooden treasure chest, isometric view, plain white "
+                                                       "background, game asset", "", 7)
+            finally:
+                if saved is None:
+                    os.environ.pop(nvidia_api.KEY_ENV, None)
+                else:
+                    os.environ[nvidia_api.KEY_ENV] = saved
+        img.thumbnail((384, 384))
+        buf = io.BytesIO()
+        img.save(buf, "PNG")
+        return {"image": "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii"),
+                "seconds": round(time.time() - t0, 1)}
 
     def ping(self, section: str, values: Dict[str, Any], chat: bool) -> Dict[str, Any]:
         cfg = validated({section: values})

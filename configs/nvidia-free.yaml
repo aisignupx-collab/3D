@@ -1,0 +1,28 @@
+# Every AI stage on NVIDIA's free hosted models (build.nvidia.com); only Blender runs locally,
+# so this works without a CUDA GPU. Get a free key (starts with nvapi-) at
+# https://build.nvidia.com/settings/api-keys and set it before starting:
+#   Windows:  set NVIDIA_API_KEY=nvapi-...        Linux/macOS:  export NVIDIA_API_KEY=nvapi-...
+#   python webui.py --config configs/nvidia-free.yaml      (or main.py --config ...)
+# Free tier: rate-limited (~40 requests/min), for prototyping; prompts and images go to NVIDIA.
+
+llm:                          # Stage 1 planner
+  provider: nvidia
+  model: deepseek-ai/deepseek-v4.1-flash
+vision:                       # Stage 6 auditor (one image per request: renders are tiled into a sheet)
+  provider: nvidia
+  model: meta/llama-3.2-90b-vision-instruct
+diffusion:                    # Stage 1 reference images
+  backend: nvidia
+  nvidia_model: black-forest-labs/flux.1-schnell
+  nvidia_steps: 4
+  width: 1024
+  height: 1024
+reconstruction:               # Stage 2 image -> 3D (textured GLB)
+  backend: nvidia
+  nvidia_model: microsoft/trellis
+blender:
+  use_gpu: true               # set false on machines without a CUDA/OptiX GPU
+texture:
+  resolution: 2048
+pipeline:
+  max_iterations: 3

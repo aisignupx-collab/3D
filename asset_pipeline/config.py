@@ -26,7 +26,7 @@ ENV_PREFIX = "ASSET_PIPELINE_"
 class LLMConfig:
     """Text LLM used for concept planning (Stage 1)."""
 
-    # ollama | openai_compatible | openai | anthropic | deepseek | gemini | openrouter | lmstudio | vllm | cli
+    # ollama | openai_compatible | openai | anthropic | deepseek | gemini | openrouter | lmstudio | vllm | nvidia | cli
     provider: str = "ollama"
     model: str = "qwen2.5:14b-instruct"
     base_url: str = "http://localhost:11434"
@@ -42,7 +42,7 @@ class LLMConfig:
 class DiffusionConfig:
     """Text-to-image concept generation (Stage 1)."""
 
-    backend: str = "diffusers"  # diffusers | comfyui
+    backend: str = "diffusers"  # diffusers | comfyui | nvidia
     model_id: str = "stabilityai/stable-diffusion-xl-base-1.0"
     # diffusers pipeline class: auto | sdxl | flux | sd
     pipeline_type: str = "auto"
@@ -58,6 +58,10 @@ class DiffusionConfig:
     comfyui_url: str = "http://127.0.0.1:8188"
     comfyui_workflow: str = ""  # optional path to an API-format workflow JSON
     comfyui_checkpoint: str = "sd_xl_base_1.0.safetensors"
+    # backend "nvidia": hosted image model on build.nvidia.com (key: NVIDIA_API_KEY)
+    nvidia_model: str = "black-forest-labs/flux.1-schnell"
+    nvidia_steps: int = 4  # FLUX.1-schnell: 1-4
+    nvidia_url: str = "https://ai.api.nvidia.com/v1/genai"
     views: List[str] = field(default_factory=lambda: ["isometric", "front", "side"])
 
 
@@ -75,7 +79,7 @@ class PreprocessConfig:
 class ReconstructionConfig:
     """Image-to-3D (Stage 2)."""
 
-    backend: str = "triposr"  # triposr | instantmesh | openlrm | command | primitive
+    backend: str = "triposr"  # triposr | instantmesh | openlrm | command | nvidia | primitive
     device: str = "cuda:0"
     # TripoSR
     triposr_repo: str = "third_party/TripoSR"
@@ -92,6 +96,13 @@ class ReconstructionConfig:
     # Generic backend: any CLI model. Placeholders: {python} {input} {output_dir}
     command_template: str = ""
     timeout_s: int = 1800
+    # backend "nvidia": hosted TRELLIS image-to-3D on build.nvidia.com (key: NVIDIA_API_KEY)
+    nvidia_model: str = "microsoft/trellis"
+    nvidia_url: str = "https://ai.api.nvidia.com/v1/genai"
+    trellis_ss_steps: int = 12  # sparse-structure sampling steps
+    trellis_ss_cfg: float = 7.5
+    trellis_slat_steps: int = 12  # structured-latent sampling steps
+    trellis_slat_cfg: float = 3.0
 
 
 @dataclass

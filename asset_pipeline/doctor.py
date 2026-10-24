@@ -96,6 +96,28 @@ def run_doctor(cfg: Config) -> int:
             ok = False
         add("comfyui", OK if ok else FAIL, cfg.diffusion.comfyui_url)
 
+    uses_nvidia = [stage for stage, used in (("planner", cfg.llm.provider == "nvidia"),
+                                             ("vision", cfg.vision.provider == "nvidia"),
+                                             ("images", cfg.diffusion.backend == "nvidia"),
+                                             ("image-to-3D", cfg.reconstruction.backend == "nvidia")) if used]
+    if uses_nvidia:
+        import os
+
+        from . import nvidia_api
+
+        key = os.environ.get(nvidia_api.KEY_ENV, "")
+        add("NVIDIA API key", OK if key.startswith("nvapi-") else (WARN if key else FAIL),
+            f"{nvidia_api.KEY_ENV} {'set' if key else 'missing - ' + nvidia_api.KEY_URL} (used for: {', '.join(uses_nvidia)})")
+        try:
+            models = nvidia_api.catalog(timeout=8)
+            wanted = [m for m, on in ((cfg.llm.model, cfg.llm.provider == "nvidia"),
+                                      (cfg.vision.model, cfg.vision.provider == "nvidia")) if on]
+            missing = [m for m in wanted if m not in models]
+            add("NVIDIA catalog", WARN if missing else OK,
+                f"{len(models)} hosted models" + (f"; not listed: {', '.join(missing)}" if missing else ""))
+        except requests.RequestException as exc:
+            add("NVIDIA catalog", FAIL, f"integrate.api.nvidia.com unreachable: {exc}")
+
     width = max(len(r[0]) for r in rows)
     for name, status, detail in rows:
         print(f"  [{status:4}] {name:<{width}}  {detail}")

@@ -340,6 +340,31 @@ class ComfyUIBackend:
             pass
 
 
+class NvidiaImageBackend:
+    """Hosted text-to-image on build.nvidia.com (FLUX.1-schnell by default; NVIDIA_API_KEY)."""
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+
+    def generate(self, prompt: str, negative: str, seed: int) -> Image.Image:
+        from . import nvidia_api
+
+        key = nvidia_api.api_key()
+        model = self.cfg.nvidia_model
+        width, height = self.cfg.width, self.cfg.height
+        if "flux" in model:
+            width, height = nvidia_api.snap_flux_size(width, height)
+        payload: Dict[str, Any] = {"prompt": prompt, "width": width, "height": height, "seed": int(seed) % 2**32,
+                                   "steps": int(self.cfg.nvidia_steps)}
+        if "flux" not in model:  # Stable Diffusion family takes a negative prompt and a guidance scale
+            payload.update(negative_prompt=negative, cfg_scale=self.cfg.guidance_scale)
+        r = nvidia_api.invoke(model, payload, key, base_url=self.cfg.nvidia_url)
+        return nvidia_api.first_image(r)
+
+    def unload(self):
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
@@ -357,6 +382,8 @@ class ReferenceGenerator:
         if self._backend is None:
             if self.cfg.backend == "comfyui":
                 self._backend = ComfyUIBackend(self.cfg)
+            elif self.cfg.backend == "nvidia":
+                self._backend = NvidiaImageBackend(self.cfg)
             elif self.cfg.backend == "diffusers":
                 self._backend = DiffusersBackend(self.cfg, self.device.split(":")[0])
             else:

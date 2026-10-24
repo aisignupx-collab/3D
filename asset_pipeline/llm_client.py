@@ -18,6 +18,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import math
 import mimetypes
 import os
 import re
@@ -42,6 +43,32 @@ def _encode_image(path: ImageInput) -> tuple:
     path = Path(path)
     media_type = mimetypes.guess_type(path.name)[0] or "image/png"
     return media_type, base64.b64encode(path.read_bytes()).decode("ascii")
+
+
+def _single_inline_image(images: Sequence[ImageInput], prompt: str) -> tuple:
+    """Tile several images into one numbered sheet, compressed to fit the inline limit."""
+    from PIL import Image, ImageDraw
+
+    from .nvidia_api import fit_image_bytes
+
+    pics = [Image.open(p).convert("RGB") for p in images]
+    if len(pics) > 1:
+        cols = math.ceil(math.sqrt(len(pics)))
+        rows = math.ceil(len(pics) / cols)
+        cell = 512
+        sheet = Image.new("RGB", (cols * cell, rows * cell), (255, 255, 255))
+        draw = ImageDraw.Draw(sheet)
+        for i, pic in enumerate(pics):
+            pic.thumbnail((cell - 8, cell - 8))
+            x, y = (i % cols) * cell, (i // cols) * cell
+            sheet.paste(pic, (x + 4, y + 4))
+            draw.rectangle((x + 4, y + 4, x + 40, y + 34), fill=(0, 0, 0))
+            draw.text((x + 12, y + 10), str(i + 1), fill=(255, 255, 255))
+        pics = [sheet]
+        prompt += (f"\n\n(The {len(images)} images are tiled into one sheet, numbered 1-{len(images)} "
+                   "left to right, top to bottom, in the order listed.)")
+    media, data = fit_image_bytes(pics[0])
+    return [(media, base64.b64encode(data).decode("ascii"))], prompt
 
 
 def split_command(command: str) -> List[str]:
@@ -86,6 +113,9 @@ PRESETS = {
     "openrouter": ("https://openrouter.ai/api/v1", "OPENROUTER_API_KEY"),  # any hosted model, one key
     "lmstudio": ("http://localhost:1234/v1", ""),
     "vllm": ("http://localhost:8000/v1", ""),
+    # build.nvidia.com: free developer key, rate-limited; deepseek-ai/deepseek-v4.1-flash,
+    # meta/llama-3.2-90b-vision-instruct, ... (one image per request, <= 180 KB inline)
+    "nvidia": ("https://integrate.api.nvidia.com/v1", "NVIDIA_API_KEY"),
 }
 OLLAMA_DEFAULT_URL = "http://localhost:11434"
 
@@ -200,6 +230,8 @@ class LLMClient:
                 return bool(self.api_key)
             elif self.provider == "cli":
                 return shutil.which(split_command(self.command)[0]) is not None
+            elif self.provider in ("nvidia", "deepseek", "gemini", "openrouter", "openai") and not self.api_key:
+                return False  # some model lists are public; without a key every chat call fails
             else:
                 headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
                 r = requests.get(f"{self._openai_root()}/models", headers=headers, timeout=5)
@@ -251,10 +283,13 @@ class LLMClient:
         messages: List[Dict[str, Any]] = []
         if system:
             messages.append({"role": "system", "content": system})
+        encoded = [_encode_image(img) for img in images]
+        if images and self.provider == "nvidia":
+            # NVIDIA's hosted VLMs take one image per request, inline up to ~180 KB
+            encoded, prompt = _single_inline_image(images, prompt)
         if images:
             content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
-            for img in images:
-                media_type, b64 = _encode_image(img)
+            for media_type, b64 in encoded:
                 content.append(
                     {"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{b64}"}}
                 )

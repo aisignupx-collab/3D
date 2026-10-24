@@ -52,8 +52,8 @@ textarea { min-height: 84px; resize: vertical; }
 .row { display: flex; gap: 10px; flex-wrap: wrap; } .row > * { flex: 1 1 140px; min-width: 0; }
 .check { display: flex; gap: 8px; align-items: center; color: var(--text); font-size: 13px; margin: 10px 0 0; }
 .check input { width: auto; }
-button.btn { background: var(--panel-2); color: var(--text); border: 1px solid var(--line); padding: 7px 12px; border-radius: 6px; font: inherit; cursor: pointer; }
-button.btn:hover { border-color: var(--muted); }
+.btn { background: var(--panel-2); color: var(--text); border: 1px solid var(--line); padding: 7px 12px; border-radius: 6px; font: inherit; cursor: pointer; }
+.btn:hover { border-color: var(--muted); }
 button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); font-weight: 600; }
 button.danger { color: var(--bad); }
 button:disabled { opacity: .5; cursor: default; }
@@ -82,6 +82,10 @@ model-viewer { width: 100%; height: 360px; background: var(--panel-2); border-ra
 .models { margin-top: 8px; max-height: 180px; overflow: auto; border: 1px solid var(--line); border-radius: 6px; }
 .models div { padding: 5px 9px; cursor: pointer; display: flex; justify-content: space-between; gap: 8px; border-bottom: 1px solid var(--line); font-size: 12.5px; }
 .models div:hover { background: var(--panel-2); }
+.nvrows { display: grid; gap: 8px; margin-top: 12px; }
+.nvrow { display: grid; grid-template-columns: minmax(0, 220px) minmax(0, 1fr) auto; gap: 10px; align-items: center; }
+.nvrow .check { margin: 0; }
+@media (max-width: 640px) { .nvrow { grid-template-columns: minmax(0, 1fr) auto; } .nvrow .check { grid-column: 1 / -1; } }
 .status { font-size: 12.5px; margin-top: 8px; color: var(--muted); white-space: pre-wrap; word-break: break-word; }
 .runs { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; }
 .run { cursor: pointer; padding: 0; overflow: hidden; }
@@ -163,9 +167,37 @@ table.kv td:first-child { color: var(--muted); width: 38%; }
       <button class="btn" data-preset="lmstudio">All local: LM Studio</button>
       <button class="btn" data-preset="ollama">All local: Ollama</button>
       <button class="btn" data-preset="deepseek">DeepSeek planner + local vision</button>
+      <button class="btn" data-preset="nvidia">All NVIDIA cloud (free)</button>
       <button class="btn" data-preset="offline">No AI models (offline)</button>
     </div>
     <p class="hint" style="margin-top:10px">LM Studio: start its server (Developer tab → Start server, port 1234) and turn on “Just-in-time model loading”. Use a text model for the planner and a vision model (VLM, e.g. Qwen2.5-VL 7B) for the auditor. On a 24 GB card keep the vision model ≤ 8B so it fits next to SDXL and TripoSR; the pipeline asks LM Studio to unload JIT-loaded models after 30 s idle.</p>
+  </div>
+  <div class="card nv" id="nvidia" style="margin-bottom:16px">
+    <h2>NVIDIA cloud: free API endpoints <span class="pill" id="nvKeyPill">no key</span></h2>
+    <p class="sub">Hosted models on build.nvidia.com with a free developer key: a planner, a vision auditor, image generation (FLUX.1) and image → 3D (TRELLIS). They take load off your GPU or replace it entirely; Blender still runs locally. The free tier is rate-limited (about 40 requests a minute) and meant for prototyping. Your prompts and images are sent to NVIDIA.</p>
+    <div class="row" style="align-items:end">
+      <div style="flex:3 1 260px"><label for="nvKey">NVIDIA API key (starts with nvapi-)</label><input type="password" id="nvKey" autocomplete="off" placeholder="paste key, or set NVIDIA_API_KEY before starting the UI"></div>
+      <div style="flex:0 0 auto" class="actions"><button class="btn" id="nvUseKey">Use key</button><a class="btn" id="nvGetKey" target="_blank" rel="noopener" style="text-decoration:none">Get a free key ↗</a></div>
+    </div>
+    <div class="nvrows">
+      <div class="nvrow"><label class="check"><input type="checkbox" data-nv="llm"> Planner (Stage 1)</label>
+        <select data-nvmodel="llm"></select>
+        <button class="btn" data-nvtest="llm">Test</button></div>
+      <div class="nvrow"><label class="check"><input type="checkbox" data-nv="vision"> Vision auditor (Stage 6)</label>
+        <select data-nvmodel="vision"></select>
+        <button class="btn" data-nvtest="vision">Test</button></div>
+      <div class="nvrow"><label class="check"><input type="checkbox" data-nv="diffusion"> Reference images (Stage 1)</label>
+        <input type="text" list="nvImageModels" data-nvmodel="diffusion">
+        <button class="btn" data-nvtest="diffusion">Test</button></div>
+      <div class="nvrow"><label class="check"><input type="checkbox" data-nv="reconstruction"> Image → 3D (Stage 2)</label>
+        <input type="text" list="nv3dModels" data-nvmodel="reconstruction">
+        <span class="hint">returns a textured GLB</span></div>
+    </div>
+    <datalist id="nvImageModels"><option value="black-forest-labs/flux.1-schnell"><option value="black-forest-labs/flux.1-dev"><option value="stabilityai/stable-diffusion-3.5-large"></datalist>
+    <datalist id="nv3dModels"><option value="microsoft/trellis"></datalist>
+    <div class="actions"><button class="btn primary" id="nvApply">Use NVIDIA for the ticked stages</button><button class="btn" id="nvRefresh">Reload model list</button><span class="hint" id="nvHint"></span></div>
+    <div class="status" id="nvStatus"></div>
+    <img id="nvPreview" alt="" hidden style="max-width:256px;border-radius:6px;margin-top:8px">
   </div>
   <div class="grid">
     <div class="card" id="card-llm"></div>
@@ -273,7 +305,8 @@ async function loadState() {
   state.saved = JSON.parse(JSON.stringify(state.values));
   $$("[data-savepath]").forEach(e => e.textContent = "Settings file: " + s.config_path);
   $("#runsDir").textContent = "Runs in " + s.output_dir;
-  renderSettings(); renderModelCards(); syncQuick(); renderKeys(s.session_keys);
+  state.nv = s.nvidia;
+  renderSettings(); renderModelCards(); syncQuick(); renderKeys(s.session_keys); initNvidia();
 }
 function fieldInput(sec, f) {
   const id = `f-${sec}-${f.key}`, name = `${sec}.${f.key}`;
@@ -422,8 +455,79 @@ $$("[data-preset]").forEach(b => b.onclick = async () => {
     apply("llm", "deepseek", "https://api.deepseek.com", "deepseek-flash", "DEEPSEEK_API_KEY");
     if (!["lmstudio", "ollama"].includes(get("vision", "provider"))) apply("vision", "lmstudio", "http://localhost:1234/v1", get("vision", "model"));
     $("#offline").checked = false; toast("DeepSeek planner: add DEEPSEEK_API_KEY under System → API keys");
+  } else if (p === "nvidia") {
+    for (const c of $$("[data-nv]")) c.checked = true;
+    await applyNvidia();
+    $("#nvidia").scrollIntoView({ behavior: "smooth" });
   } else { $("#offline").checked = true; toast("Offline: knowledge-base planning, metrics-only audit"); }
   syncQuick();
+});
+
+// ------------------------------------------------------------------ NVIDIA cloud
+const NV_FIELD = { llm: ["provider", "model"], vision: ["provider", "model"], diffusion: ["backend", "nvidia_model"], reconstruction: ["backend", "nvidia_model"] };
+function nvDefault(sec) { return { llm: state.nv.planner, vision: state.nv.vision, diffusion: state.nv.image, reconstruction: state.nv.model3d }[sec]; }
+function nvKeyPill(set) { const p = $("#nvKeyPill"); p.textContent = set ? "key set" : "no key"; p.className = "pill " + (set ? "ok" : "warn"); }
+async function initNvidia() {
+  $("#nvGetKey").href = state.nv.key_url;
+  nvKeyPill(state.nv.key_set);
+  for (const sec of Object.keys(NV_FIELD)) {
+    const [kind, modelKey] = NV_FIELD[sec], on = get(sec, kind) === "nvidia";
+    $(`[data-nv="${sec}"]`).checked = on;
+    const el = $(`[data-nvmodel="${sec}"]`), cur = on ? get(sec, modelKey) : nvDefault(sec);
+    if (el.tagName === "SELECT") { el.innerHTML = ""; el.add(new Option(cur, cur)); } else el.value = cur || nvDefault(sec);
+  }
+  loadNvModels(true);
+}
+async function loadNvModels(quiet) {
+  try {
+    const r = await api("/api/models?provider=nvidia&base_url=");
+    for (const [sec, vision] of [["llm", false], ["vision", true]]) {
+      const el = $(`[data-nvmodel="${sec}"]`), cur = el.value || nvDefault(sec);
+      const ids = r.models.filter(m => m.vision === vision || (sec === "llm" && m.vision)).map(m => m.id);
+      if (!ids.includes(cur)) ids.unshift(cur);
+      el.innerHTML = ids.map(i => `<option ${i === cur ? "selected" : ""}>${esc(i)}</option>`).join("");
+    }
+    $("#nvHint").textContent = `${r.models.length} hosted models · ${r.models.filter(m => m.vision).length} take images`;
+  } catch (e) { if (!quiet) toast("NVIDIA catalog: " + e.message); $("#nvHint").textContent = "Model list unavailable (offline?)"; }
+}
+async function applyNvidia() {
+  const used = [];
+  for (const sec of Object.keys(NV_FIELD)) {
+    if (!$(`[data-nv="${sec}"]`).checked) continue;
+    const [kind, modelKey] = NV_FIELD[sec], model = $(`[data-nvmodel="${sec}"]`).value || nvDefault(sec);
+    set(sec, kind, "nvidia"); set(sec, modelKey, model);
+    if (sec === "llm" || sec === "vision") {
+      set(sec, "base_url", "https://integrate.api.nvidia.com/v1"); set(sec, "api_key_env", "NVIDIA_API_KEY");
+      const el = $("#card-" + sec); for (const k of ["provider", "base_url", "model", "api_key_env"]) writeField($(`[data-m="${k}"]`, el), get(sec, k)); onProvider(sec, true);
+    }
+    used.push(sec);
+  }
+  if (used.length) $("#offline").checked = false;
+  syncQuick();
+  toast(used.length ? `NVIDIA cloud for: ${used.join(", ")}` + (state.nv.key_set ? "" : ". Add your key above.") : "Tick at least one stage");
+}
+$("#nvApply").onclick = applyNvidia;
+$("#nvRefresh").onclick = () => loadNvModels(false);
+$("#nvUseKey").onclick = async () => {
+  const v = $("#nvKey").value.trim();
+  if (v && !v.startsWith("nvapi-")) { toast("NVIDIA keys start with nvapi-"); return; }
+  const r = await api("/api/keys", { keys: { NVIDIA_API_KEY: v } });
+  state.nv.key_set = r.session_keys.includes("NVIDIA_API_KEY") || state.envKeys?.NVIDIA_API_KEY; nvKeyPill(state.nv.key_set);
+  $("#nvKey").value = ""; renderKeys(r.session_keys); toast(v ? "Key kept in memory for this session" : "Session key cleared");
+};
+$$("[data-nvtest]").forEach(b => b.onclick = async () => {
+  const sec = b.dataset.nvtest, status = $("#nvStatus"), model = $(`[data-nvmodel="${sec}"]`).value;
+  status.textContent = `Testing ${model}…`; $("#nvPreview").hidden = true;
+  try {
+    if (sec === "diffusion") {
+      const r = await api("/api/nvidia/test_image", { values: { ...state.values.diffusion, backend: "nvidia", nvidia_model: model } });
+      $("#nvPreview").src = r.image; $("#nvPreview").hidden = false; status.textContent = `Image from ${model} in ${r.seconds}s`;
+    } else {
+      const r = await api("/api/ping", { section: sec, chat: true, values: { ...state.values[sec], provider: "nvidia", model, base_url: "https://integrate.api.nvidia.com/v1", api_key_env: "NVIDIA_API_KEY" } });
+      status.textContent = !r.reachable ? "No key, or the key was rejected: paste it above and press Use key." :
+        r.chat_error ? `Key OK, but ${model} failed: ${r.chat_error}` : `${model} answered “${r.reply}” in ${r.chat_seconds}s`;
+    }
+  } catch (e) { status.textContent = e.message; }
 });
 
 // quick controls on the Models / Generate tabs mirror individual settings

@@ -2,7 +2,7 @@
 # asset_pipeline/config.py. Env overrides: ASSET_PIPELINE_<SECTION>__<KEY>=value
 
 llm:                         # Stage 1 concept planner (text)
-  # ollama | openai_compatible | lmstudio | vllm | openai | anthropic | deepseek | gemini | openrouter | cli
+  # ollama | openai_compatible | lmstudio | vllm | nvidia | openai | anthropic | deepseek | gemini | openrouter | cli
   provider: ollama
   model: qwen2.5:14b-instruct
   base_url: http://localhost:11434   # vLLM: http://localhost:8000  LM Studio: http://localhost:1234
@@ -16,7 +16,7 @@ vision:                      # Stage 6 auditor (must accept images)
   base_url: http://localhost:11434
 
 diffusion:                   # Stage 1 reference images
-  backend: diffusers         # diffusers | comfyui
+  backend: diffusers         # diffusers | comfyui | nvidia (hosted FLUX.1, key NVIDIA_API_KEY)
   model_id: stabilityai/stable-diffusion-xl-base-1.0   # or black-forest-labs/FLUX.1-schnell
   pipeline_type: auto        # auto | sdxl | flux | sd
   steps: 30
@@ -27,6 +27,8 @@ diffusion:                   # Stage 1 reference images
   comfyui_url: http://127.0.0.1:8188
   comfyui_workflow: ""       # API-format JSON with {{prompt}} {{negative}} {{seed}} {{width}} {{height}}
   comfyui_checkpoint: sd_xl_base_1.0.safetensors
+  nvidia_model: black-forest-labs/flux.1-schnell   # backend nvidia
+  nvidia_steps: 4
   views: [isometric, front, side]
 
 preprocess:
@@ -36,7 +38,7 @@ preprocess:
   projection_size: 2048      # high-res copy of the reconstruction input, projected back as texture
 
 reconstruction:              # Stage 2
-  backend: triposr           # triposr | instantmesh | openlrm | command | primitive
+  backend: triposr           # triposr | instantmesh | openlrm | command | nvidia (hosted TRELLIS) | primitive
   device: cuda:0
   triposr_repo: third_party/TripoSR
   mc_resolution: 256         # marching-cubes grid; 320-384 for more detail (more VRAM)
@@ -47,6 +49,7 @@ reconstruction:              # Stage 2
   openlrm_python: third_party/OpenLRM/.venv/bin/python
   # command backend example (TRELLIS / Hunyuan3D / SF3D CLI); placeholders: {python} {input} {input_rgba} {output_dir}
   command_template: ""
+  nvidia_model: microsoft/trellis   # backend nvidia: textured GLB, no local GPU needed
 
 blender:
   executable: ""             # auto-detect; or e.g. /opt/blender-4.2/blender, C:\Program Files\Blender Foundation\Blender 4.2\blender.exe

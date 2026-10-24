@@ -217,7 +217,8 @@ run from the page and a run from the command line give the same result.
   Runs are queued and run one at a time, because they share the GPU. Cancel stops the run,
   Blender included.
 * **Models:** one-click setups for *all local with LM Studio*, *all local with Ollama*,
-  *DeepSeek planner + local vision* and *offline*. **Find models** asks LM Studio or Ollama which
+  *DeepSeek planner + local vision*, *all NVIDIA cloud (free)* and *offline*. The **NVIDIA cloud**
+  section (see below) switches each AI stage to NVIDIA's free hosted models. **Find models** asks LM Studio or Ollama which
   models it has, and marks the vision-capable (VLM) ones and the ones already loaded. **Test a
   reply** sends a one-line message, which catches a wrong model name before a 5-minute run. This
   tab also picks the diffusion model (SDXL, SDXL Turbo, FLUX.1-schnell, SD Turbo, or ComfyUI) and
@@ -234,6 +235,40 @@ run from the page and a run from the command line give the same result.
 API keys typed into the System tab stay in the UI's memory for that session and reach runs as
 environment variables. They are never written to a file. The server only answers on localhost
 (`--host 0.0.0.0` opens it to your network, without a login).
+
+### NVIDIA cloud: free API endpoints
+
+[build.nvidia.com](https://build.nvidia.com) hosts many models behind one free developer key. The
+pipeline can use them for any of its four AI stages, each switched on separately:
+
+| Stage | Setting | Default NVIDIA model |
+|---|---|---|
+| 1 planner | `llm.provider: nvidia` | `deepseek-ai/deepseek-v4.1-flash` |
+| 1 reference images | `diffusion.backend: nvidia` | `black-forest-labs/flux.1-schnell` |
+| 2 image → 3D | `reconstruction.backend: nvidia` | `microsoft/trellis` (textured GLB) |
+| 6 vision auditor | `vision.provider: nvidia` | `meta/llama-3.2-90b-vision-instruct` |
+
+1. Create a key at <https://build.nvidia.com/settings/api-keys> (it starts with `nvapi-`).
+2. Either set `NVIDIA_API_KEY` before starting the UI, or paste it into **Models → NVIDIA cloud →
+   Use key**. Pasted keys stay in memory only.
+3. Tick the stages to run on NVIDIA, pick the models (the list is NVIDIA's live catalogue, with the
+   vision-capable ones in the vision list), use **Test** on each, then **Use NVIDIA for the ticked
+   stages**. Or run everything with `--config configs/nvidia-free.yaml`.
+
+With all four stages on NVIDIA, only Blender runs locally, so a machine without a CUDA GPU works.
+Mixing also works: local SDXL and TripoSR on your 4090, with NVIDIA's large planner and vision
+models, keeps VRAM free for the GPU stages. Things to know:
+
+* **Limits.** The free tier is rate-limited (about 40 requests a minute) and meant for prototyping.
+  A run makes roughly 3-8 requests per refinement round.
+* **Privacy.** Prompts, reference images and audit renders are sent to NVIDIA.
+* **One image per request.** Inline images are limited to about 180 KB. The auditor's renders are
+  tiled into one numbered sheet and compressed to fit, and bigger TRELLIS inputs are uploaded as
+  NVCF assets.
+* **TRELLIS reports no input camera.** Stage 4 therefore bakes TRELLIS's own texture instead of
+  re-projecting the reference image, and templates still get the per-material tiles.
+* **Model IDs change.** `python main.py --doctor` warns when a configured NVIDIA model is no
+  longer in the catalogue.
 
 ### Local models with LM Studio (RTX 4090)
 
@@ -542,6 +577,8 @@ keeps its model resident. SDXL + a 7B VLM fit together. FLUX-dev + VLM don't, so
 | Landmark rigging + skin cleanup + pose test | Procedural mannequin, A-pose / T-pose / Rigify: all joints detected, 100% bone-heat coverage, <1% bad edges |
 | MCP server | Real MCP client (`mcp` SDK 2.3) listed the tools and ran `generate_asset` to an approved GLB |
 | Ollama / OpenAI-compatible / Anthropic / presets / `cli` clients | Wire formats tested against a local fake server and a stub CLI, not a live model |
+| NVIDIA cloud (chat, vision, FLUX images, TRELLIS 3D) | Live public catalogue read from integrate.api.nvidia.com; requests, 202 polling, image tiling/size limits and key errors tested against a local fake of the API. Not run with a real key: field names follow NVIDIA's published samples |
+| Web UI | Driven in headless Chromium: settings, LM Studio discovery (fake server), NVIDIA section, a full dry-run job, phone width |
 | CUDA GPU paths, SDXL/FLUX, ComfyUI, InstantMesh, OpenLRM | Implemented against their documented interfaces but not executed in this environment; run `python main.py --doctor` first |
 
 ## Project layout
@@ -552,7 +589,8 @@ webui.py (webui.bat, webui.sh)  local web UI: settings, model pickers, runs, GPU
 config.example.yaml             all settings with comments
 asset_pipeline/
   config.py                     dataclass config, YAML + env loading, Blender discovery
-  llm_client.py                 Ollama / OpenAI-compatible / OpenAI / Anthropic, text + vision
+  llm_client.py                 Ollama / OpenAI-compatible / OpenAI / Anthropic / NVIDIA, text + vision
+  nvidia_api.py                 build.nvidia.com: key, catalogue, genai calls (FLUX, TRELLIS), assets
   concept_planner.py            Stage 1 spec agent + knowledge base
   reference_generator.py        Stage 1 diffusion (diffusers/ComfyUI) + rembg preprocessing
   mesh_reconstruction.py        Stage 2 backends
@@ -565,6 +603,7 @@ asset_pipeline/
 mcp_server.py                   MCP tools for Claude Code / Codex / OpenCode
 configs/rtx4090.yaml            tuned settings for a 24 GB RTX 4090 (Ollama models)
 configs/lmstudio-rtx4090.yaml   the same with LM Studio serving the planner and vision models
+configs/nvidia-free.yaml        every AI stage on NVIDIA's free hosted models (only Blender local)
 scripts/inspect_export.py       (in Blender) what an engine sees in an exported GLB/FBX/OBJ
 scripts/collect_results.py      bundle runs into a QA results summary + zip
 docs/QA_TEST_PROMPT.md          brief for an AI/human tester to install, run and audit the pipeline

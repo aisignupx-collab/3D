@@ -6,6 +6,8 @@ Backends
                   ~16 GB VRAM, UV texture map)
   ``openlrm``     subprocess into its own venv (vertex-coloured PLY)
   ``command``     any CLI model (TRELLIS, Hunyuan3D, SF3D, ...) via a template
+  ``nvidia``      hosted TRELLIS on build.nvidia.com (free key, no local GPU;
+                  textured GLB)
   ``primitive``   no-GPU placeholder blob at the spec's proportions, for
                   testing Blender stages and CI
 
@@ -250,6 +252,38 @@ class CommandBackend:
         pass
 
 
+class NvidiaTrellisBackend:
+    """Hosted TRELLIS image-to-3D (build.nvidia.com, NVIDIA_API_KEY). Returns a textured GLB.
+
+    The cutout (RGBA) is sent; TRELLIS segments the object itself. No input camera is
+    reported, so Stage 4 bakes the model's own (good) texture instead of re-projecting.
+    """
+
+    def __init__(self, cfg, seed: int = 0):
+        self.cfg = cfg
+        self.seed = seed
+
+    def reconstruct(self, prepared: str, rgba: str, out_dir: Path) -> RawMesh:
+        from PIL import Image
+
+        from . import nvidia_api
+
+        key = nvidia_api.api_key()
+        image, assets = nvidia_api.image_reference(Image.open(rgba or prepared), key, keep_alpha=True)
+        payload = {"image": image, "seed": int(self.seed) % 2**31,
+                   "ss_sampling_steps": int(self.cfg.trellis_ss_steps), "ss_cfg_scale": float(self.cfg.trellis_ss_cfg),
+                   "slat_sampling_steps": int(self.cfg.trellis_slat_steps),
+                   "slat_cfg_scale": float(self.cfg.trellis_slat_cfg)}
+        r = nvidia_api.invoke(self.cfg.nvidia_model, payload, key, base_url=self.cfg.nvidia_url,
+                              timeout=self.cfg.timeout_s, asset_ids=assets)
+        out = out_dir / "raw_trellis.glb"
+        out.write_bytes(nvidia_api.first_glb(r))
+        return RawMesh(str(out), "nvidia", has_texture=True, **_mesh_stats(out))
+
+    def unload(self):
+        pass
+
+
 class PrimitiveBackend:
     """Deterministic stand-in for a neural reconstruction.
 
@@ -319,6 +353,7 @@ class MeshReconstructor:
             "instantmesh": lambda: InstantMeshBackend(cfg),
             "openlrm": lambda: OpenLRMBackend(cfg),
             "command": lambda: CommandBackend(cfg),
+            "nvidia": lambda: NvidiaTrellisBackend(cfg, seed),
             "primitive": lambda: PrimitiveBackend(cfg, dimensions, seed),
         }
         if cfg.backend not in backends:
